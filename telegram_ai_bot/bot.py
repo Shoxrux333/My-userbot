@@ -255,6 +255,18 @@ def register_message_handlers(client_inst):
                     notification = response.get("notification")
                     memory_update = response.get("memory_update", {})
 
+                    # Retrieve my own ID (owner) to see if we can trigger prompt/memory updates
+                    try:
+                        me = await client_inst.get_me()
+                        my_id = me.id if me else OWNER_ID
+                    except Exception:
+                        my_id = OWNER_ID
+
+                    # If notifying owner because the bot doesn't know the answer or for other reasons,
+                    # force reply to be empty so the bot does not reply to the user.
+                    if notify_owner and user_id != my_id:
+                        reply = ""
+
                     # 7. Save incoming assistant message to history
                     if reply and reply.strip():
                         await MessageRepository.save_message(
@@ -265,10 +277,6 @@ def register_message_handlers(client_inst):
                         )
                         # Send reply using Telethon
                         await event.reply(reply, parse_mode="md")
-
-                    # Retrieve my own ID (owner) to see if we can trigger prompt/memory updates
-                    me = await client_inst.get_me()
-                    my_id = me.id
 
                     # 8. Handle on-the-fly memory extraction (only if sender is owner)
                     if user_id == my_id and memory_update and memory_update.get("should_save"):

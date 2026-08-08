@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build directories
+dist/
+build/
+.cache/
+
+# Local database and session files
+*.session
+*.session-journal
+*.db
+*.sqlite
+*.sqlite3
+telegram_ai_bot/database/*.db
+telegram_ai_bot/*.session
+
+# Sensitive information
+.env
+.env.*
+!.env.example
+telegram_ai_bot/.env
+
+# Git & IDEs
+.git/
+.github/
+.vscode/
+.idea/
+.DS_Store
+*.log

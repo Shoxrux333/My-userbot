@@ -247,6 +247,10 @@ function startBot() {
 startBot();
 
 // API routes
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", botStatus: botProcess ? "running" : "stopped" });
+});
+
 app.get("/api/bot-logs", (req, res) => {
   res.json({ logs: botLogs });
 });

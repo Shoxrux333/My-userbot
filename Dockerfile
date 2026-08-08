@@ -1,13 +1,12 @@
 # Use Node.js as the base image
 FROM node:20-slim
 
-# Install system dependencies (Python 3, pip, venv, sqlite3, and build tools)
+# Install system dependencies (Python 3, pip, venv, and sqlite3)
 RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
     sqlite3 \
-    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Environment variables to avoid pip PEP 668 warnings inside Docker

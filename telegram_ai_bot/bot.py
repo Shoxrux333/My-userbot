@@ -10,7 +10,7 @@ from telethon.errors import SessionPasswordNeededError
 from config import TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE, OWNER_ID, MAX_HISTORY_MESSAGES
 from database.database import init_db, AsyncSessionLocal
 from database.repositories import UserRepository, MessageRepository, MemoryRepository
-from database.models import PersonalMemory, Message
+from database.models import PersonalMemory
 from services.ai import generate_response
 from services.memory import MemoryService
 from prompts.system_prompt import get_system_prompt
@@ -31,89 +31,6 @@ phone_code_hash_cache = {}
 pending_credentials = {}
 userbot_active = False
 
-# --- Filter cache: faylni har safar diskdan o'qish o'rniga xotirada saqlaymiz ---
-_filter_cache = {
-    "data": None,
-    "mtime": 0.0,
-    "path": os.path.join(os.path.dirname(__file__), "filter_settings.json")
-}
-
-# --- Owner ID cache: get_me() ni faqat bir marta chaqiramiz ---
-_cached_owner_id = None
-
-
-def _load_filter_settings() -> dict | None:
-    """
-    filter_settings.json faylini faqat o'zgarganda qayta o'qiydi (mtime tekshiruv).
-    Xotirada cache qilinadi — disk I/O deyarli yo'q.
-    """
-    path = _filter_cache["path"]
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return None
-
-    cached = _filter_cache
-    if cached["data"] is not None and cached["mtime"] == mtime:
-        return cached["data"]
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        _filter_cache["data"] = data
-        _filter_cache["mtime"] = mtime
-        return data
-    except Exception as e:
-        logger.error(f"Error loading filter_settings.json: {e}")
-        return cached["data"]  # eski cache'ni qaytar (fayl nosoz bo'lsa ham ishlaydi)
-
-
-def _to_int_set(lst) -> set[int]:
-    """Ro'yxatni butun sonlar set'ga aylantirish."""
-    result = set()
-    for x in lst:
-        try:
-            result.add(int(x))
-        except (ValueError, TypeError):
-            pass
-    return result
-
-
-async def _get_my_owner_id(client_inst) -> int:
-    """
-    Owner ID ni aniqlash: avval env dan, keyin get_me() dan.
-    Natijani cache qiladi — Telegram API ga faqat 1 marta so'rov.
-    """
-    global _cached_owner_id
-    if _cached_owner_id is not None:
-        return _cached_owner_id
-
-    # ENV dan aniqlash
-    if OWNER_ID and OWNER_ID != 0:
-        _cached_owner_id = OWNER_ID
-        return _cached_owner_id
-
-    # get_me() orqali aniqlash
-    try:
-        me = await client_inst.get_me()
-        if me:
-            _cached_owner_id = me.id
-            logger.info(f"Owner ID aniqlandi (get_me): {_cached_owner_id}")
-            return _cached_owner_id
-    except Exception as e:
-        logger.warning(f"get_me() chaqirishda xatolik: {e}")
-
-    # Hech qanday ID topilmasa, 0 qaytaramiz (owner aniqlanmadi)
-    _cached_owner_id = 0
-    return 0
-
-
-def invalidate_filter_cache():
-    """Web panel orqali filter o'zgarganda cache'ni tozalash."""
-    _filter_cache["data"] = None
-    _filter_cache["mtime"] = 0.0
-
-
 async def seed_initial_memories():
     """
     Seeds initial memories about Shoxrux if the database memory table is empty.
@@ -125,10 +42,26 @@ async def seed_initial_memories():
                 logger.info("Xotiralar bazasi bo'sh. Dastlabki ma'lumotlar yuklanmoqda...")
                 
                 initial_data = [
-                    {"category": "shaxsiy", "key": "ism", "value": "Shoxrux Aminboyev"},
-                    {"category": "qiziqishlar", "key": "ai", "value": "Shoxrux AI, Generative AI va prompt engineering bilan qiziqadi."},
-                    {"category": "texnologiya", "key": "backend", "value": "Shoxrux Django REST Framework yordamida backend dasturlash bilan shug'ullanadi."},
-                    {"category": "qiziqishlar", "key": "psixologiya", "value": "Shoxrux psixologiya kitoblariga qiziqadi va ularni o'qishni yaxshi ko'radi."}
+                    {
+                        "category": "shaxsiy",
+                        "key": "ism",
+                        "value": "Shoxrux Aminboyev"
+                    },
+                    {
+                        "category": "qiziqishlar",
+                        "key": "ai",
+                        "value": "Shoxrux AI, Generative AI va prompt engineering bilan qiziqadi."
+                    },
+                    {
+                        "category": "texnologiya",
+                        "key": "backend",
+                        "value": "Shoxrux Django REST Framework yordamida backend dasturlash bilan shug'ullanadi."
+                    },
+                    {
+                        "category": "qiziqishlar",
+                        "key": "psixologiya",
+                        "value": "Shoxrux psixologiya kitoblariga qiziqadi va ularni o'qishni yaxshi ko'radi."
+                    }
                 ]
                 
                 for item in initial_data:
@@ -138,54 +71,27 @@ async def seed_initial_memories():
                         key=item["key"],
                         value=item["value"]
                     )
-                await session.commit()
                 logger.info("Dastlabki ma'lumotlar muvaffaqiyatli yuklandi.")
     except Exception as e:
         logger.error(f"Dastlabki ma'lumotlarni yuklashda xatolik: {e}", exc_info=True)
 
-
 async def stats_exporter():
     """
-    Background loop — stats.json ni yangilash.
-    Optimizatsiya: 60 soniya interval (10 o'rniga), bitta combined so'rov.
+    Background loop that writes stats to stats.json for the Node.js developer console.
     """
-    from sqlalchemy import select, func
-    from database.models import User, Message, PersonalMemory
-
+    from database.repositories import StatsRepository
     while True:
         try:
             async with AsyncSessionLocal() as session:
-                # Bitta so'rovda barcha statistikani olish
-                from sqlalchemy import case
-                ai_count_expr = func.count(
-                    case((Message.role == "assistant", 1))
-                ).label("ai_count")
-
-                stmt = select(
-                    func.count(User.id).label("users"),
-                    func.coalesce(ai_count_expr, 0).label("ai"),
-                    func.count(Message.id).label("messages"),
-                    func.count(PersonalMemory.id).label("memory")
-                )
-                result = await session.execute(stmt)
-                row = result.one()
-
-                stats = {
-                    "users": row.users or 0,
-                    "messages": row.messages or 0,
-                    "memory": row.memory or 0,
-                    "ai": row.ai or 0
-                }
-
-                stats_path = os.path.join(os.path.dirname(__file__), "stats.json")
-                with open(stats_path, "w") as f:
+                stats = await StatsRepository.get_stats(session)
+                with open("stats.json", "w") as f:
                     json.dump(stats, f)
         except Exception as e:
-            logger.error(f"Error exporting stats: {e}")
-        await asyncio.sleep(60)
-
+            logger.error(f"Error exporting stats to stats.json: {e}")
+        await asyncio.sleep(10)
 
 def save_credentials_to_dotenv(api_id, api_hash, phone):
+    # Paths relative to telegram_ai_bot running folder
     paths = [".env", "../.env"]
     for path in paths:
         if os.path.exists(path):
@@ -227,7 +133,6 @@ def save_credentials_to_dotenv(api_id, api_hash, phone):
             except Exception as e:
                 logger.error(f"Error writing to {path}: {e}")
 
-
 # Register Telethon Message Handler
 def register_message_handlers(client_inst):
     @client_inst.on(events.NewMessage(incoming=True))
@@ -247,54 +152,68 @@ def register_message_handlers(client_inst):
             if not message_text:
                 return
 
-            # --- ID Filter: cache'dan o'qiladi, disk I/O yo'q ---
+            # Check ID filters (Blacklist & Group Whitelist)
             try:
-                filter_data = _load_filter_settings()
-
-                if filter_data is not None:
+                settings_path = os.path.join(os.path.dirname(__file__), "filter_settings.json")
+                if os.path.exists(settings_path):
+                    with open(settings_path, "r", encoding="utf-8") as f:
+                        filter_data = json.load(f)
+                    
                     blacklist_enabled = filter_data.get("blacklist_enabled", False)
                     blocked_ids = filter_data.get("blocked_ids", [])
                     group_filter_enabled = filter_data.get("group_filter_enabled", False)
                     allowed_group_ids = filter_data.get("allowed_group_ids", [])
 
-                    blocked_set = _to_int_set(blocked_ids)
-                    allowed_set = _to_int_set(allowed_group_ids)
+                    # Convert lists of strings/numbers to integers
+                    def to_ints(lst):
+                        res = []
+                        for x in lst:
+                            try:
+                                res.append(int(x))
+                            except ValueError:
+                                pass
+                        return res
 
-                    # Owner ID ni cache'dan olamiz (har safar get_me() chaqirmaymiz)
-                    my_id = await _get_my_owner_id(client_inst)
-                    is_owner = (user_id == my_id)
+                    blocked_ids_ints = to_ints(blocked_ids)
+                    allowed_group_ids_ints = to_ints(allowed_group_ids)
 
-                    # 1. Blacklist (owner hech qachon bloklanmaydi)
+                    # Determine if sender is me (the owner)
+                    is_owner = (user_id == OWNER_ID)
+                    try:
+                        me = await client_inst.get_me()
+                        if me and user_id == me.id:
+                            is_owner = True
+                    except Exception:
+                        pass
+
+                    # 1. Blacklist check (never blocks Owner)
                     if blacklist_enabled and not is_owner:
-                        if user_id in blocked_set or event.chat_id in blocked_set:
+                        if user_id in blocked_ids_ints or event.chat_id in blocked_ids_ints:
                             fullname = f"{first_name or ''} {last_name or ''}".strip() or "Ismsiz"
-                            logger.info(f"ID Filter: Blocked {fullname} (ID: {user_id}, Chat: {event.chat_id})")
+                            logger.info(f"ID Filter: Blocked message from {fullname} (ID: {user_id}, Chat: {event.chat_id}) - blacklisted")
                             return
 
-                    # 2. Group filter
+                    # 2. Group filter check
                     if not event.is_private:
                         if not group_filter_enabled:
-                            # Group filter o'chirilgan = guruhlarda javob berilmasin
+                            # If group filter is disabled, do not respond in groups/channels at all
                             return
-                        elif allowed_set:
-                            # Ruxsat etilgan guruhlar ro'yxati bo'sh bo'lmasa, faqat o'shanda tekshir
-                            if event.chat_id not in allowed_set:
-                                logger.info(f"ID Filter: Unauthorized group (ID: {event.chat_id})")
+                        else:
+                            # Group filter is enabled, check if current group chat_id is allowed
+                            if event.chat_id not in allowed_group_ids_ints:
+                                logger.info(f"ID Filter: Ignored message in unauthorized group (ID: {event.chat_id})")
                                 return
-                        # allowed_set bo'sh va group_filter_enabled=True =>
-                        # HAMMA guruhlarga ruxsat (safiya whitelist, hech narsa bloklanmaydi)
-
             except Exception as fe:
                 logger.error(f"Error checking filters: {fe}")
 
-            # Ignore commands
+            # Ignore commands in PM unless they are something specific
             if message_text.startswith("/"):
                 return
 
             # Show typing action
             async with client_inst.action(event.chat_id, 'typing'):
                 async with AsyncSessionLocal() as session:
-                    # 1. Register or update user
+                    # 1. Register or update the user
                     user = await UserRepository.get_or_create_user(
                         session=session,
                         telegram_user_id=user_id,
@@ -303,13 +222,13 @@ def register_message_handlers(client_inst):
                         last_name=last_name
                     )
 
-                    # 2. Save user message (commit keyin qilinadi)
-                    user_msg = Message(
+                    # 2. Save incoming user message
+                    await MessageRepository.save_message(
+                        session=session,
                         telegram_user_id=user_id,
                         role="user",
                         content=message_text
                     )
-                    session.add(user_msg)
 
                     # 3. Get recent chat history
                     chat_history = await MessageRepository.get_chat_history(
@@ -318,19 +237,16 @@ def register_message_handlers(client_inst):
                         limit=MAX_HISTORY_MESSAGES
                     )
 
-                    # 4. Get memories (cache'dan yoki DB dan)
+                    # 4. Get all memories as text
                     memories_text = await MemoryRepository.get_memories_text(session)
 
-                    # 5. Build system prompt
+                    # 5. Build dynamic system prompt
                     system_prompt = get_system_prompt(memories_text)
-
-                    # --- DB commit: user + message birgalikda saqlanadi ---
-                    await session.commit()
 
                     # 6. Call AI API
                     response = await generate_response(
                         system_prompt=system_prompt,
-                        chat_history=chat_history[:-1],
+                        chat_history=chat_history[:-1], # pass history before saving current msg
                         user_message=message_text
                     )
 
@@ -340,31 +256,36 @@ def register_message_handlers(client_inst):
                     notification = response.get("notification")
                     memory_update = response.get("memory_update", {})
 
-                    # Owner ID (cached)
-                    my_id = await _get_my_owner_id(client_inst)
+                    # Retrieve my own ID (owner) to see if we can trigger prompt/memory updates
+                    try:
+                        me = await client_inst.get_me()
+                        my_id = me.id if me else OWNER_ID
+                    except Exception:
+                        my_id = OWNER_ID
 
-                    # AI error handling
+                    # If there was an AI error (e.g. missing/invalid API key or parsing failure)
                     if error_msg:
-                        reply = ""
+                        reply = "" # Ensure we never reply to other users with raw errors
                         fullname = f"{first_name or ''} {last_name or ''}".strip() or "Ismsiz foydalanuvchi"
                         username_str = f"@{username}" if username else "username yo'q"
                         owner_error_log = (
-                            f"\u26a0\ufe0f *Xabar qayta ishlashda xatolik yuz berdi:*\n"
-                            f"\ud83d\udc64 Kimdan: {fullname} ({username_str}, ID: `{user_id}`)\n"
-                            f"\ud83d\udcdd Yozgan xabari: _{message_text}_\n\n"
-                            f"\u274c *Xatolik:* `{error_msg}`\n"
-                            f"\ud83d\udca1 _Eslatma: Ushbu xatolik faqat o'zingizga yuborildi._"
+                            f"⚠️ *Xabar qayta ishlashda xatolik yuz berdi:*\n"
+                            f"👤 Kimdan: {fullname} ({username_str}, ID: `{user_id}`)\n"
+                            f"📝 Yozgan xabari: _{message_text}_\n\n"
+                            f"❌ *Xatolik:* `{error_msg}`\n"
+                            f"💡 _Eslatma: Ushbu xatolik faqat o'zingizga (Saqlangan xabarlar) yuborildi, boshqa foydalanuvchilar buni ko'rmaydi._"
                         )
                         try:
                             await client_inst.send_message("me", owner_error_log, parse_mode="md")
                         except Exception as se:
-                            logger.error(f"Failed to send error notification: {se}")
+                            logger.error(f"Failed to send error notification to Saved Messages: {se}")
 
-                    # Notify owner => reply bo'sh
+                    # If notifying owner because the bot doesn't know the answer or for other reasons,
+                    # force reply to be empty so the bot does not reply to the user.
                     if notify_owner and user_id != my_id:
                         reply = ""
 
-                    # 7. Save assistant reply + commit
+                    # 7. Save incoming assistant message to history
                     if reply and reply.strip():
                         await MessageRepository.save_message(
                             session=session,
@@ -372,27 +293,25 @@ def register_message_handlers(client_inst):
                             role="assistant",
                             content=reply
                         )
-                        await session.commit()
+                        # Send reply using Telethon
                         await event.reply(reply, parse_mode="md")
 
-                    # 8. Memory extraction (owner only)
+                    # 8. Handle on-the-fly memory extraction (only if sender is owner)
                     if user_id == my_id and memory_update and memory_update.get("should_save"):
-                        # Yangi session — commit alohida
-                        async with AsyncSessionLocal() as mem_session:
-                            saved = await MemoryService.process_memory_update(mem_session, memory_update)
+                        saved = await MemoryService.process_memory_update(session, memory_update)
                         if saved:
-                            category = memory_update.get('category', "noma'lum")
-                            key = memory_update.get('key', "noma'lum")
+                            category = memory_update.get('category', 'noma\'lum')
+                            key = memory_update.get('key', 'noma\'lum')
                             val = memory_update.get('value', message_text)
                             await event.reply(
-                                f"\ud83e\udde0 *Tizim:* Shaxsiy xotirangizga yangi ma'lumot saqlandi!\n"
-                                f"\ud83d\udcc1 Kategoriya: `{category}`\n"
-                                f"\ud83d\udd11 Kalit: `{key}`\n"
-                                f"\ud83d\udcdd Fakt: _{val}_",
+                                f"🧠 *Tizim:* Shaxsiy xotirangizga yangi ma'lumot saqlandi!\n"
+                                f"📁 Kategoriya: `{category}`\n"
+                                f"🔑 Kalit: `{key}`\n"
+                                f"📝 Fakt: _{val}_",
                                 parse_mode="md"
-                            )
+                              )
 
-                    # 9. System prompt update (owner only)
+                    # 9. Handle automatic system prompt modification (only if sender is owner)
                     prompt_update = response.get("prompt_update", {})
                     if user_id == my_id and prompt_update and prompt_update.get("should_update"):
                         new_prompt = prompt_update.get("new_system_prompt")
@@ -402,27 +321,28 @@ def register_message_handlers(client_inst):
                                 with open(PROMPT_FILE_PATH, "w", encoding="utf-8") as f:
                                     f.write(new_prompt)
                                 await event.reply(
-                                    "\ud83e\udde0 *Tizim:* System prompt muvaffaqiyatli yangilandi!",
+                                    "🧠 *Tizim:* Sening buyrug'ing bo'yicha bot tizim ko'rsatmalari (System Prompt) muvaffaqiyatli yangilandi va saqlandi!",
                                     parse_mode="md"
                                 )
                             except Exception as pe:
-                                logger.error(f"Failed to update system prompt: {pe}")
+                                logger.error(f"Failed to update system prompt file: {pe}")
 
-                    # 10. Owner notifications
+                    # 10. Handle owner notifications (from ordinary users) -> sent to Saved Messages
                     if notify_owner and notification and user_id != my_id:
                         fullname = f"{first_name or ''} {last_name or ''}".strip() or "Ismsiz foydalanuvchi"
                         notify_msg = (
-                            f"\ud83d\udd14 *Yangi Bildirishnoma ({fullname} @{username or ''}):*\n"
+                            f"🔔 *Yangi Bildirishnoma (Foydalanuvchi: {fullname} @{username or ''}):*\n"
                             f"{notification}"
                         )
                         await client_inst.send_message("me", notify_msg, parse_mode="md")
 
         except Exception as e:
-            logger.error(f"Error in chat handler: {e}", exc_info=True)
+            logger.error(f"Error in chat handler for user: {e}", exc_info=True)
             try:
+                # Notify owner in Saved Messages about the unhandled exception
                 err_msg = (
-                    f"\ud83d\udea8 *Bot tizimida kutilmagan xatolik!*\n"
-                    f"\u274c Xatolik: `{str(e)}`"
+                    f"🚨 *Bot tizimida kutilmagan xatolik yuz berdi!*\n"
+                    f"❌ Xatolik tafsiloti: `{str(e)}`"
                 )
                 await client_inst.send_message("me", err_msg, parse_mode="md")
             except Exception:
@@ -457,6 +377,7 @@ async def http_get_status(request):
             logger.error(f"Error checking status: {e}")
             logged_in = False
 
+    # Also check from env
     if not phone and TELEGRAM_PHONE:
         phone = TELEGRAM_PHONE
     if not api_id and TELEGRAM_API_ID:
@@ -484,6 +405,7 @@ async def http_send_code(request):
 
         api_id = int(api_id_str)
 
+        # Disconnect existing client if any
         if client:
             await client.disconnect()
 
@@ -510,7 +432,7 @@ async def http_send_code(request):
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def http_verify_code(request):
-    global client, phone_code_hash_cache, pending_credentials, userbot_active, _cached_owner_id
+    global client, phone_code_hash_cache, pending_credentials, userbot_active
     try:
         data = await request.json()
         code = data.get("code", "").strip()
@@ -520,14 +442,14 @@ async def http_verify_code(request):
             return web.json_response({"success": False, "error": "Verification code is required"}, status=400)
 
         if not pending_credentials or not client:
-            return web.json_response({"success": False, "error": "No pending connection."}, status=400)
+            return web.json_response({"success": False, "error": "No pending connection. Please request code first."}, status=400)
 
         phone = pending_credentials["phone"]
         api_id = pending_credentials["api_id"]
         api_hash = pending_credentials["api_hash"]
         phone_code_hash = phone_code_hash_cache.get(phone)
 
-        logger.info(f"Signing in for {phone}...")
+        logger.info(f"Signing in for {phone} with code {code}...")
         try:
             await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
@@ -537,35 +459,31 @@ async def http_verify_code(request):
                     "password_required": True, 
                     "error": "Ikki bosqichli parol (2FA) talab qilinadi!"
                 })
-            logger.info("2FA password required, signing in...")
+            logger.info("2FA password required, singing in with password...")
             await client.sign_in(password=password)
 
+        # If we got here, sign-in is successful!
+        # Save credentials to config files
         save_credentials_to_dotenv(api_id, api_hash, phone)
+
+        # Clear temp variables
         pending_credentials = {}
 
-        # Owner ID ni hozir aniqlab olamiz (keyin har safar get_me() chaqirilmaydi)
-        try:
-            me = await client.get_me()
-            if me:
-                _cached_owner_id = me.id
-                logger.info(f"Owner ID cache'landi: {_cached_owner_id}")
-        except Exception:
-            pass
-
+        # Set up handler and turn userbot active
         register_message_handlers(client)
         userbot_active = True
 
         logger.info("Userbot successfully authorized and message listener started!")
         return web.json_response({
             "success": True,
-            "message": "Userbot muvaffaqiyatli ishga tushirildi!"
+            "message": "Userbot muvaffaqiyatli ishga tushirildi va shaxsiy hisobingizga ulandi!"
         })
     except Exception as e:
         logger.error(f"Error in http_verify_code: {e}", exc_info=True)
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def http_logout(request):
-    global client, userbot_active, _cached_owner_id
+    global client, userbot_active
     try:
         if client:
             try:
@@ -576,18 +494,19 @@ async def http_logout(request):
             client = None
         
         userbot_active = False
-        _cached_owner_id = None
 
-        for fname in ["userbot.session", "userbot.session-journal"]:
-            if os.path.exists(fname):
+        # Remove session files
+        for f in ["userbot.session", "userbot.session-journal"]:
+            if os.path.exists(f):
                 try:
-                    os.remove(fname)
+                    os.remove(f)
                 except Exception:
                     pass
 
+        # Clean credentials from .env
         save_credentials_to_dotenv("", "", "")
 
-        logger.info("Userbot logged out.")
+        logger.info("Userbot logged out and session files cleared.")
         return web.json_response({"success": True, "message": "Userbot tizimdan chiqarildi."})
     except Exception as e:
         logger.error(f"Error in http_logout: {e}", exc_info=True)
@@ -598,11 +517,16 @@ async def main():
     global client, userbot_active
 
     logger.info("Database va jadvallarni tekshirish...")
+    # Initialize DB (creates files/tables if not exist)
     await init_db()
+    
+    # Pre-seed initial database memories
     await seed_initial_memories()
 
+    # Start the stats exporter task in background
     asyncio.create_task(stats_exporter())
 
+    # Try auto-login if credentials exist in env
     if TELEGRAM_API_ID and TELEGRAM_API_HASH:
         try:
             api_id = int(TELEGRAM_API_ID)
@@ -612,23 +536,15 @@ async def main():
             await client.connect()
 
             if await client.is_user_authorized():
-                # Owner ID ni bir marta aniqlab olamiz
-                try:
-                    me = await client.get_me()
-                    if me:
-                        _cached_owner_id = me.id
-                        logger.info(f"Owner ID aniqlandi: {_cached_owner_id}")
-                except Exception:
-                    pass
-
                 register_message_handlers(client)
                 userbot_active = True
                 logger.info("Userbot session automatically authorized!")
             else:
-                logger.info("Session not authorized. Waiting for web login.")
+                logger.info("Userbot session exists but is not authorized yet. Waiting for web login.")
         except Exception as e:
             logger.error(f"Failed to auto-start userbot: {e}")
 
+    # Set up aiohttp server for internal node.js queries
     app = web.Application()
     app.router.add_get('/status', http_get_status)
     app.router.add_post('/send-code', http_send_code)
@@ -639,8 +555,9 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, 'localhost', 8000)
     await site.start()
-    logger.info("Internal API started on http://localhost:8000")
+    logger.info("Internal communication API started on http://localhost:8000")
 
+    # Keep running forever
     try:
         while True:
             await asyncio.sleep(3600)

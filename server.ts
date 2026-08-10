@@ -482,20 +482,92 @@ app.post("/api/userbot/logout", async (req, res) => {
   }
 });
 
-// Lazy-loaded Gemini Client helper
-function getGeminiClient() {
-  const key = process.env.GEMINI_API_KEY || process.env.AI_API_KEY;
+// Robust helper to clean and normalize JSON responses from AI
+function cleanJsonResponse(text: string): string {
+  let cleaned = text.trim();
+  const match = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (match) {
+    cleaned = match[1].trim();
+  }
+  cleaned = cleaned.replace(/^```(?:json)?\s*/i, "");
+  cleaned = cleaned.replace(/\s*```$/, "");
+  return cleaned.trim();
+}
+
+// Unified robust AI completion helper supporting both Google Gemini and OpenAI-compatible APIs
+async function callAI(prompt: string, responseSchema?: any): Promise<string> {
+  const key = process.env.GEMINI_API_KEY || process.env.AI_API_KEY || "";
   if (!key) {
     throw new Error("Gemini yoki OpenAI API kaliti topilmadi. Iltimos, Sozlamalar -> Secrets panelida yoki bot sozlamalarida kalit kiriting.");
   }
-  return new GoogleGenAI({
-    apiKey: key,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
+
+  const isGemini = key.trim().startsWith("AIzaSy");
+
+  if (isGemini) {
+    let model = "gemini-2.5-flash";
+    const envModel = process.env.AI_MODEL;
+    if (envModel && (envModel.includes("gemini") || envModel.includes("gpt"))) {
+      if (envModel.includes("gemini")) {
+        model = envModel;
       }
     }
-  });
+    
+    const ai = new GoogleGenAI({
+      apiKey: key,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        }
+      }
+    });
+
+    const response = await ai.models.generateContent({
+      model: model,
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: responseSchema
+      }
+    });
+
+    return response.text || "";
+  } else {
+    // OpenAI / Custom Endpoint via Fetch API
+    const baseUrl = process.env.AI_BASE_URL || "https://api.openai.com/v1";
+    const model = process.env.AI_MODEL || "gpt-4o-mini";
+
+    const messages = [
+      {
+        role: "system",
+        content: "Siz faqatgina belgilangan struktura bo'yicha to'g'ri, toza JSON javob beradigan aqlli AI yordamchisiz. Javobingizda hech qanday qo'shimcha matn yoki tushuntirish bo'lmasligi shart. Faqat to'g'ri JSON formatida qaytaring."
+      },
+      {
+        role: "user",
+        content: prompt
+      }
+    ];
+
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${key}`
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: messages,
+        response_format: { type: "json_object" }
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`AI API error (${response.status}): ${errorText}`);
+    }
+
+    const data = await response.json() as any;
+    return data.choices?.[0]?.message?.content || "";
+  }
 }
 
 // Endpoint 1: Direct Memory Optimization using AI
@@ -506,10 +578,7 @@ app.post("/api/gemini/memory-optimize", async (req, res) => {
   }
 
   try {
-    const ai = getGeminiClient();
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: `Quyidagi foydalanuvchi yozgan shaxsiy ma'lumot yoki eslatmani tahlil qiling va uni tizimli shaxsiy xotira (memory) ko'rinishida shakllantiring.
+    const prompt = `Quyidagi foydalanuvchi yozgan shaxsiy ma'lumot yoki eslatmani tahlil qiling va uni tizimli shaxsiy xotira (memory) ko'rinishida shakllantiring.
 Foydalanuvchi matni: "${rawText}"
 
 Javobingizni faqat JSON formatida quyidagi strukturada qaytaring:
@@ -517,27 +586,21 @@ Javobingizni faqat JSON formatida quyidagi strukturada qaytaring:
   "category": "Mavzuga mos toifa, masalan: 'shaxsiy', 'ish', 'soglik', 'reja', 'qiziqishlar' (kichik harflarda, max 1 so'z)",
   "key": "Qisqa va aniq kalit so'z, masalan: 'sevimli taom', 'uyg'onish vaqti' (kichik harflarda)",
   "value": "To'liq, aniq eslab qolinadigan fakt yoki qoida o'zbek tilida"
-}`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            category: { type: Type.STRING },
-            key: { type: Type.STRING },
-            value: { type: Type.STRING }
-          },
-          required: ["category", "key", "value"]
-        }
-      }
-    });
+}`;
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new Error("AI javob bera olmadi.");
-    }
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        category: { type: Type.STRING },
+        key: { type: Type.STRING },
+        value: { type: Type.STRING }
+      },
+      required: ["category", "key", "value"]
+    };
 
-    const parsed = JSON.parse(resultText);
+    const responseText = await callAI(prompt, schema);
+    const cleanedText = cleanJsonResponse(responseText);
+    const parsed = JSON.parse(cleanedText);
     const { category, key, value } = parsed;
 
     // Save to database using our script runner
@@ -566,8 +629,6 @@ app.post("/api/gemini/memory-chat", async (req, res) => {
     // Fetch current memories to pass as context
     const currentMemories = await runQueryScript(["memories"]);
     const memoriesStr = JSON.stringify(currentMemories?.memories || [], null, 2);
-
-    const ai = getGeminiClient();
 
     // Format chat history
     const formattedHistory = (history || []).map((h: any) => `${h.role === "user" ? "Foydalanuvchi" : "AI"}: ${h.content}`).join("\n");
@@ -598,36 +659,26 @@ Javobni faqat JSON formatida qaytaring:
   } // yoki null
 }`;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        reply: { type: Type.STRING },
+        new_memory: {
           type: Type.OBJECT,
           properties: {
-            reply: { type: Type.STRING },
-            new_memory: {
-              type: Type.OBJECT,
-              properties: {
-                category: { type: Type.STRING },
-                key: { type: Type.STRING },
-                value: { type: Type.STRING }
-              },
-              required: ["category", "key", "value"]
-            }
+            category: { type: Type.STRING },
+            key: { type: Type.STRING },
+            value: { type: Type.STRING }
           },
-          required: ["reply"]
+          required: ["category", "key", "value"]
         }
-      }
-    });
+      },
+      required: ["reply"]
+    };
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new Error("AI javob bera olmadi.");
-    }
-
-    const parsed = JSON.parse(resultText);
+    const responseText = await callAI(prompt, schema);
+    const cleanedText = cleanJsonResponse(responseText);
+    const parsed = JSON.parse(cleanedText);
     let dbResult = null;
     if (parsed.new_memory && parsed.new_memory.category && parsed.new_memory.key && parsed.new_memory.value) {
       dbResult = await runQueryScript([
@@ -658,10 +709,7 @@ app.post("/api/gemini/parse-ids", async (req, res) => {
   }
 
   try {
-    const ai = getGeminiClient();
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Siz Telegram ID raqamlarini matndan ajratib beruvchi aqlli yordamchisiz.
+    const prompt = `Siz Telegram ID raqamlarini matndan ajratib beruvchi aqlli yordamchisiz.
 Sizga foydalanuvchi turli xil matnlar, guruh xabarlari yoki shunchaki ID ro'yxatini beradi. Sizning vazifangiz ushbu matndan barcha Telegram ID raqamlarini (masalan: 1234567, -10012345678, -456789123 va hk) aniqlash va guruhlashdan iborat.
 Agar matnda ularning bloklangan/spam/taqiqlanganligi aytilgan bo'lsa (masalan: "spam", "blokla", "taqiqlanganlar", "blacklist"), ularni blacklisted_ids ro'yxatiga qo'shing.
 Agar guruhlarga taalluqliligi aytilgan bo'lsa (masalan: "guruhlar", "ruxsat berilgan", "oq ro'yxat", "whitelist"), ularni whitelisted_group_ids ro'yxatiga qo'shing.
@@ -674,36 +722,30 @@ Javobni faqat ushbu JSON formatida qaytaring:
   "blacklisted_ids": ["ID_1", "ID_2"],
   "whitelisted_group_ids": ["ID_3", "ID_4"],
   "unspecified_ids": ["ID_5", "ID_6"]
-}`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            blacklisted_ids: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            whitelisted_group_ids: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            unspecified_ids: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            }
-          },
-          required: ["blacklisted_ids", "whitelisted_group_ids", "unspecified_ids"]
+}`;
+
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        blacklisted_ids: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING }
+        },
+        whitelisted_group_ids: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING }
+        },
+        unspecified_ids: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING }
         }
-      }
-    });
+      },
+      required: ["blacklisted_ids", "whitelisted_group_ids", "unspecified_ids"]
+    };
 
-    const resultText = response.text;
-    if (!resultText) {
-      throw new Error("AI tahlil qila olmadi.");
-    }
-
-    const parsed = JSON.parse(resultText);
+    const responseText = await callAI(prompt, schema);
+    const cleanedText = cleanJsonResponse(responseText);
+    const parsed = JSON.parse(cleanedText);
     res.json({ success: true, ...parsed });
   } catch (err: any) {
     addBotLog(`ERROR in parse-ids AI: ${err.message}`);

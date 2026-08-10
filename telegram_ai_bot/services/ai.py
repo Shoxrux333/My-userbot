@@ -6,6 +6,35 @@ from config import AI_API_KEY, AI_BASE_URL, AI_MODEL
 
 logger = logging.getLogger(__name__)
 
+# ── Singleton AI client (reused across all messages) ──
+_ai_client: AsyncOpenAI | None = None
+_ai_model: str = ""
+_ai_base_url: str = ""
+
+
+def _get_ai_client():
+    """Return a singleton AsyncOpenAI client with current config."""
+    global _ai_client, _ai_model, _ai_base_url
+    key = AI_API_KEY
+    base_url = AI_BASE_URL
+    model = AI_MODEL
+
+    # Auto-detect Gemini key
+    if key.strip().startswith("AIzaSy"):
+        if "api.openai.com" in base_url or not base_url:
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        if model == "gpt-4o-mini" or not model:
+            model = "gemini-2.5-flash"
+
+    if _ai_client is None or base_url != _ai_base_url or model != _ai_model:
+        _ai_client = AsyncOpenAI(api_key=key, base_url=base_url)
+        _ai_model = model
+        _ai_base_url = base_url
+        logger.info(f"AI client created: base_url={base_url}, model={model}")
+
+    return _ai_client, model
+
+
 def clean_json_response(text: str) -> str:
     """
     Cleans markdown wrappers and code block formatting from the text
@@ -113,73 +142,43 @@ def parse_robust_json(text: str) -> dict:
 async def generate_response(system_prompt: str, chat_history: list, user_message: str) -> dict:
     """
     Generates response from the AI using OpenAI-compatible client.
-    
-    chat_history: list of Message models
+    chat_history: list of objects with .role and .content
     user_message: current message content
     """
     if not AI_API_KEY:
-        logger.warning("AI_API_KEY topilmadi yoki kiritilmagan.")
+        logger.warning("AI_API_KEY topilmadi.")
         return {
             "reply": "",
-            "error_msg": "AI API kaliti (AI_API_KEY yoki GEMINI_API_KEY) kiritilmagan! Iltimos, veb panel yoki Render sozlamalari orqali API kalitni kiriting.",
+            "error_msg": "AI API kaliti kiritilmagan!",
             "notify_owner": False,
             "notification": None,
             "memory_update": {"should_save": False, "category": None, "key": None, "value": None}
         }
 
-    # Initialize client
-    api_key = AI_API_KEY
-    base_url = AI_BASE_URL
-    model = AI_MODEL
-
-    # Auto-detect Google Gemini API Key (starts with AIzaSy)
-    if api_key.strip().startswith("AIzaSy"):
-        if "api.openai.com" in base_url or not base_url:
-            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-            logger.info("Detected Google Gemini API key. Overriding base_url to Google OpenAI-compatible endpoint.")
-        if model == "gpt-4o-mini" or not model:
-            model = "gemini-2.5-flash"
-            logger.info("Detected Google Gemini API key with default OpenAI model. Overriding model to gemini-2.5-flash.")
-
-    logger.info(f"Connecting to AI API with base_url: {base_url}, model: {model}")
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    ai_client, model = _get_ai_client()
 
     # Build messages list
     messages = [{"role": "system", "content": system_prompt}]
-    
     for msg in chat_history:
-        # Map DB role (user, assistant, system) to API roles
-        role = msg.role
-        if role == "assistant":
-            role = "assistant"
-        elif role == "user":
-            role = "user"
-        messages.append({"role": role, "content": msg.content})
-        
+        messages.append({"role": msg.role, "content": msg.content})
     messages.append({"role": "user", "content": user_message})
 
     try:
-        # We attempt to request a JSON response
-        # To be highly compatible with non-OpenAI endpoints, we first try standard request
-        # but ask for JSON in the prompt (which is already done in system_prompt)
-        response = await client.chat.completions.create(
+        response = await ai_client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=0.7,
             max_tokens=1500,
         )
-        
         response_text = response.choices[0].message.content
-        logger.info(f"Raw AI response: {response_text}")
-        
         parsed_data = parse_robust_json(response_text)
         return parsed_data
-            
+
     except Exception as e:
-        logger.error(f"AI API chaqiruvida xatolik yuz berdi: {e}", exc_info=True)
+        logger.error(f"AI API xatolik: {e}")
         return {
             "reply": "",
-            "error_msg": f"AI API chaqiruvida xatolik yuz berdi: {str(e)}",
+            "error_msg": f"AI API xatolik: {str(e)}",
             "notify_owner": False,
             "notification": None,
             "memory_update": {"should_save": False, "category": None, "key": None, "value": None}

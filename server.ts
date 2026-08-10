@@ -4,6 +4,7 @@ import { spawn, ChildProcess, exec } from "child_process";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
+import { GoogleGenAI, Type } from "@google/genai";
 
 dotenv.config();
 
@@ -256,6 +257,7 @@ app.get("/api/bot-logs", (req, res) => {
 });
 
 app.get("/api/bot-status", (req, res) => {
+  dotenv.config({ override: true });
   res.json({
     status: botProcess ? "running" : "stopped",
     shouldBeRunning,
@@ -305,6 +307,7 @@ app.post("/api/bot-start", (req, res) => {
 });
 
 app.post("/api/bot-config", (req, res) => {
+  dotenv.config({ override: true });
   const { BOT_TOKEN, AI_API_KEY, OWNER_ID, AI_BASE_URL, AI_MODEL, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE } = req.body;
 
   if (BOT_TOKEN !== undefined) process.env.BOT_TOKEN = BOT_TOKEN;
@@ -359,6 +362,33 @@ app.get("/api/userbot/status", async (req, res) => {
 });
 
 app.post("/api/userbot/send-code", async (req, res) => {
+  const { api_id, api_hash, phone } = req.body;
+  
+  // Reload current env first to prevent overwriting other variables
+  dotenv.config({ override: true });
+
+  if (api_id !== undefined) process.env.TELEGRAM_API_ID = api_id;
+  if (api_hash !== undefined) process.env.TELEGRAM_API_HASH = api_hash;
+  if (phone !== undefined) process.env.TELEGRAM_PHONE = phone;
+
+  const envContent = `BOT_TOKEN=${process.env.BOT_TOKEN || ""}\n` +
+                     `TELEGRAM_API_ID=${process.env.TELEGRAM_API_ID || ""}\n` +
+                     `TELEGRAM_API_HASH=${process.env.TELEGRAM_API_HASH || ""}\n` +
+                     `TELEGRAM_PHONE=${process.env.TELEGRAM_PHONE || ""}\n` +
+                     `AI_API_KEY=${process.env.AI_API_KEY || ""}\n` +
+                     `AI_BASE_URL=${process.env.AI_BASE_URL || "https://api.openai.com/v1"}\n` +
+                     `AI_MODEL=${process.env.AI_MODEL || "gpt-4o-mini"}\n` +
+                     `OWNER_ID=${process.env.OWNER_ID || ""}\n` +
+                     `MAX_HISTORY_MESSAGES=${process.env.MAX_HISTORY_MESSAGES || "20"}\n`;
+
+  try {
+    fs.writeFileSync(".env", envContent, "utf8");
+    fs.writeFileSync(path.join(process.cwd(), "telegram_ai_bot", ".env"), envContent, "utf8");
+    addBotLog("Saved userbot credentials to .env files upon verification code request.");
+  } catch (err: any) {
+    addBotLog(`ERROR saving credentials on send-code: ${err.message}`);
+  }
+
   try {
     const response = await fetch("http://localhost:8000/send-code", {
       method: "POST",
@@ -395,6 +425,174 @@ app.post("/api/userbot/logout", async (req, res) => {
     res.json(data);
   } catch (err: any) {
     res.status(500).json({ success: false, error: "Failed to log out from Python userbot." });
+  }
+});
+
+// Lazy-loaded Gemini Client helper
+function getGeminiClient() {
+  const key = process.env.GEMINI_API_KEY || process.env.AI_API_KEY;
+  if (!key) {
+    throw new Error("Gemini yoki OpenAI API kaliti topilmadi. Iltimos, Sozlamalar -> Secrets panelida yoki bot sozlamalarida kalit kiriting.");
+  }
+  return new GoogleGenAI({
+    apiKey: key,
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      }
+    }
+  });
+}
+
+// Endpoint 1: Direct Memory Optimization using AI
+app.post("/api/gemini/memory-optimize", async (req, res) => {
+  const { rawText } = req.body;
+  if (!rawText) {
+    return res.status(400).json({ success: false, error: "Matn bo'sh bo'lishi mumkin emas." });
+  }
+
+  try {
+    const ai = getGeminiClient();
+    const response = await ai.models.generateContent({
+      model: "gemini-3.6-flash",
+      contents: `Quyidagi foydalanuvchi yozgan shaxsiy ma'lumot yoki eslatmani tahlil qiling va uni tizimli shaxsiy xotira (memory) ko'rinishida shakllantiring.
+Foydalanuvchi matni: "${rawText}"
+
+Javobingizni faqat JSON formatida quyidagi strukturada qaytaring:
+{
+  "category": "Mavzuga mos toifa, masalan: 'shaxsiy', 'ish', 'soglik', 'reja', 'qiziqishlar' (kichik harflarda, max 1 so'z)",
+  "key": "Qisqa va aniq kalit so'z, masalan: 'sevimli taom', 'uyg'onish vaqti' (kichik harflarda)",
+  "value": "To'liq, aniq eslab qolinadigan fakt yoki qoida o'zbek tilida"
+}`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            category: { type: Type.STRING },
+            key: { type: Type.STRING },
+            value: { type: Type.STRING }
+          },
+          required: ["category", "key", "value"]
+        }
+      }
+    });
+
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("AI javob bera olmadi.");
+    }
+
+    const parsed = JSON.parse(resultText);
+    const { category, key, value } = parsed;
+
+    // Save to database using our script runner
+    const dbResult = await runQueryScript(["add_memory", category, key, value]);
+    res.json({
+      success: true,
+      category,
+      key,
+      value,
+      dbResult
+    });
+  } catch (err: any) {
+    addBotLog(`ERROR in memory-optimize: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Endpoint 2: Memory Chat Conversational Agent
+app.post("/api/gemini/memory-chat", async (req, res) => {
+  const { message, history } = req.body;
+  if (!message) {
+    return res.status(400).json({ success: false, error: "Xabar bo'sh bo'lishi mumkin emas." });
+  }
+
+  try {
+    // Fetch current memories to pass as context
+    const currentMemories = await runQueryScript(["memories"]);
+    const memoriesStr = JSON.stringify(currentMemories?.memories || [], null, 2);
+
+    const ai = getGeminiClient();
+
+    // Format chat history
+    const formattedHistory = (history || []).map((h: any) => `${h.role === "user" ? "Foydalanuvchi" : "AI"}: ${h.content}`).join("\n");
+
+    const prompt = `Siz shaxsiy xotiralarni boshqaruvchi aqlli va samimiy AI yordamchisiz (xuddi Claude's memory xususiyati kabi).
+Foydalanuvchi siz bilan gaplashib yangi ma'lumotlarni xotiraga qo'shishi, borlarini o'zgartirishi yoki ko'rishi mumkin.
+
+Foydalanuvchining hozirgi xotira bazasi:
+${memoriesStr}
+
+Suhbat tarixi:
+${formattedHistory}
+
+Foydalanuvchining yangi xabari: "${message}"
+
+Vazifangiz:
+1. Foydalanuvchining xabariga samimiy, qisqa va aniq qilingan o'zbek tilida javob bering.
+2. Agar foydalanuvchi yangi ma'lumot bergan bo'lsa (yoki biror ma'lumotni eslab qolishni so'rasa), uni xotira bazasiga qo'shish uchun mos category, key va value qiymatlarini aniqlang va "new_memory" maydonida qaytaring.
+3. Agar foydalanuvchi faqat gaplashayotgan bo'lsa yoki savol berayotgan bo'lsa, "new_memory" maydonini null qiling.
+
+Javobni faqat JSON formatida qaytaring:
+{
+  "reply": "Foydalanuvchiga yuboriladigan samimiy javob matni o'zbek tilida.",
+  "new_memory": {
+    "category": "shaxsiy / ish / soglik / reja va hk.",
+    "key": "kalit so'z",
+    "value": "eslab qolinadigan fakt yoki eslatma"
+  } // yoki null
+}`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.6-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            reply: { type: Type.STRING },
+            new_memory: {
+              type: Type.OBJECT,
+              properties: {
+                category: { type: Type.STRING },
+                key: { type: Type.STRING },
+                value: { type: Type.STRING }
+              },
+              required: ["category", "key", "value"]
+            }
+          },
+          required: ["reply"]
+        }
+      }
+    });
+
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("AI javob bera olmadi.");
+    }
+
+    const parsed = JSON.parse(resultText);
+    let dbResult = null;
+    if (parsed.new_memory && parsed.new_memory.category && parsed.new_memory.key && parsed.new_memory.value) {
+      dbResult = await runQueryScript([
+        "add_memory",
+        parsed.new_memory.category.toLowerCase(),
+        parsed.new_memory.key.toLowerCase(),
+        parsed.new_memory.value
+      ]);
+    }
+
+    res.json({
+      success: true,
+      reply: parsed.reply,
+      newMemory: parsed.new_memory,
+      dbResult
+    });
+  } catch (err: any) {
+    addBotLog(`ERROR in memory-chat: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 

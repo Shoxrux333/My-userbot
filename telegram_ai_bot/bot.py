@@ -251,6 +251,7 @@ def register_message_handlers(client_inst):
                     )
 
                     reply = response.get("reply", "")
+                    error_msg = response.get("error_msg", "")
                     notify_owner = response.get("notify_owner", False)
                     notification = response.get("notification")
                     memory_update = response.get("memory_update", {})
@@ -261,6 +262,23 @@ def register_message_handlers(client_inst):
                         my_id = me.id if me else OWNER_ID
                     except Exception:
                         my_id = OWNER_ID
+
+                    # If there was an AI error (e.g. missing/invalid API key or parsing failure)
+                    if error_msg:
+                        reply = "" # Ensure we never reply to other users with raw errors
+                        fullname = f"{first_name or ''} {last_name or ''}".strip() or "Ismsiz foydalanuvchi"
+                        username_str = f"@{username}" if username else "username yo'q"
+                        owner_error_log = (
+                            f"⚠️ *Xabar qayta ishlashda xatolik yuz berdi:*\n"
+                            f"👤 Kimdan: {fullname} ({username_str}, ID: `{user_id}`)\n"
+                            f"📝 Yozgan xabari: _{message_text}_\n\n"
+                            f"❌ *Xatolik:* `{error_msg}`\n"
+                            f"💡 _Eslatma: Ushbu xatolik faqat o'zingizga (Saqlangan xabarlar) yuborildi, boshqa foydalanuvchilar buni ko'rmaydi._"
+                        )
+                        try:
+                            await client_inst.send_message("me", owner_error_log, parse_mode="md")
+                        except Exception as se:
+                            logger.error(f"Failed to send error notification to Saved Messages: {se}")
 
                     # If notifying owner because the bot doesn't know the answer or for other reasons,
                     # force reply to be empty so the bot does not reply to the user.
@@ -291,7 +309,7 @@ def register_message_handlers(client_inst):
                                 f"🔑 Kalit: `{key}`\n"
                                 f"📝 Fakt: _{val}_",
                                 parse_mode="md"
-                            )
+                              )
 
                     # 9. Handle automatic system prompt modification (only if sender is owner)
                     prompt_update = response.get("prompt_update", {})
@@ -320,6 +338,15 @@ def register_message_handlers(client_inst):
 
         except Exception as e:
             logger.error(f"Error in chat handler for user: {e}", exc_info=True)
+            try:
+                # Notify owner in Saved Messages about the unhandled exception
+                err_msg = (
+                    f"🚨 *Bot tizimida kutilmagan xatolik yuz berdi!*\n"
+                    f"❌ Xatolik tafsiloti: `{str(e)}`"
+                )
+                await client_inst.send_message("me", err_msg, parse_mode="md")
+            except Exception:
+                pass
 
 
 # HTTP REST API Handlers for Node.js server

@@ -24,7 +24,10 @@ import {
   Plus,
   ShieldAlert,
   UserX,
-  Users
+  Users,
+  Brain,
+  Sparkles,
+  Send
 } from "lucide-react";
 
 interface LogLine {
@@ -304,6 +307,7 @@ export default function App() {
   const [systemPrompt, setSystemPrompt] = useState("");
   const [isSavingPrompt, setIsSavingPrompt] = useState(false);
   const [promptMessage, setPromptMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [isEditingPrompt, setIsEditingPrompt] = useState(false);
 
   // SQLite Database States
   const [dbUsers, setDbUsers] = useState<any[]>([]);
@@ -319,6 +323,19 @@ export default function App() {
   const [newMemory, setNewMemory] = useState({ category: "", key: "", value: "" });
   const [isAddingMemory, setIsAddingMemory] = useState(false);
   const [memoryMessage, setMemoryMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+
+  // Aqlli Xotira (Smart Memory) states
+  const [memoryMode, setMemoryMode] = useState<"quick" | "chat">("quick"); // 'quick' or 'chat'
+  const [quickInputType, setQuickInputType] = useState<"ai" | "manual">("ai"); // 'ai' or 'manual'
+  const [rawQuickText, setRawQuickText] = useState("");
+  const [isOptimizingMemory, setIsOptimizingMemory] = useState(false);
+  
+  // Memory AI Chat states
+  const [memoryChatInput, setMemoryChatInput] = useState("");
+  const [memoryChatHistory, setMemoryChatHistory] = useState<Array<{ role: "user" | "assistant"; content: string; newMemory?: any }>>([
+    { role: "assistant", content: "Salom! Men sizning shaxsiy xotira yordamchingizman. Menga o'zingiz haqizda biror ma'lumot ayting (masalan: 'Men ingliz tilini o'rganyapman' yoki 'Dushanba kunlari soat 10da darsim bor'), men uni avtomatik tahrirlab bot xotirasiga yozib qo'yaman." }
+  ]);
+  const [isSendingMemoryChat, setIsSendingMemoryChat] = useState(false);
 
   const logsContainerRef = useRef<HTMLDivElement>(null);
   const hasPrefilled = useRef(false);
@@ -362,11 +379,14 @@ export default function App() {
   };
 
   const fetchSystemPrompt = async () => {
+    if (isEditingPrompt) return;
     try {
       const res = await fetch("/api/system-prompt");
       if (res.ok && res.headers.get("content-type")?.includes("application/json")) {
         const data = await res.json();
-        setSystemPrompt(data.prompt || "");
+        if (!isEditingPrompt) {
+          setSystemPrompt(data.prompt || "");
+        }
       }
     } catch (e) {
       console.error("Failed to fetch system prompt:", e);
@@ -451,6 +471,88 @@ export default function App() {
       setMemoryMessage({ type: "error", text: "Server bilan aloqa bog'lab bo'lmadi." });
     } finally {
       setIsAddingMemory(false);
+    }
+  };
+
+  const handleQuickAiSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!rawQuickText.trim()) return;
+
+    setIsOptimizingMemory(true);
+    setMemoryMessage(null);
+    try {
+      const res = await fetch("/api/gemini/memory-optimize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawText: rawQuickText })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setMemoryMessage({
+          type: "success",
+          text: `AI ma'lumotni saqladi: [${data.category.toUpperCase()}] ${data.key} -> ${data.value}`
+        });
+        setRawQuickText("");
+        fetchDbMemories();
+        fetchBotData();
+        setTimeout(() => setMemoryMessage(null), 5000);
+      } else {
+        setMemoryMessage({ type: "error", text: data.error || "AI optimizatsiyasida xatolik yuz berdi. API Key to'g'ri ekanligini tekshiring." });
+      }
+    } catch (err) {
+      setMemoryMessage({ type: "error", text: "Server bilan bog'lanishda xatolik." });
+    } finally {
+      setIsOptimizingMemory(false);
+    }
+  };
+
+  const handleMemoryChatSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!memoryChatInput.trim() || isSendingMemoryChat) return;
+
+    const userMsg = memoryChatInput.trim();
+    setMemoryChatInput("");
+
+    const updatedHistory = [...memoryChatHistory, { role: "user" as const, content: userMsg }];
+    setMemoryChatHistory(updatedHistory);
+    setIsSendingMemoryChat(true);
+
+    try {
+      const res = await fetch("/api/gemini/memory-chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: userMsg,
+          history: updatedHistory.slice(-6)
+        })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setMemoryChatHistory(prev => [
+          ...prev,
+          {
+            role: "assistant" as const,
+            content: data.reply,
+            newMemory: data.newMemory
+          }
+        ]);
+        if (data.newMemory) {
+          fetchDbMemories();
+          fetchBotData();
+        }
+      } else {
+        setMemoryChatHistory(prev => [
+          ...prev,
+          { role: "assistant" as const, content: `Xatolik: ${data.error || "AI javob bera olmadi. API kalitini tekshiring."}` }
+        ]);
+      }
+    } catch (err) {
+      setMemoryChatHistory(prev => [
+        ...prev,
+        { role: "assistant" as const, content: "Server bilan bog'lanishda xatolik." }
+      ]);
+    } finally {
+      setIsSendingMemoryChat(false);
     }
   };
 
@@ -607,7 +709,7 @@ export default function App() {
       });
       if (res.ok) {
         setPromptMessage({ type: "success", text: "Tizim ko'rsatmalari (System Prompt) muvaffaqiyatli saqlandi!" });
-        fetchSystemPrompt();
+        setIsEditingPrompt(false);
         setTimeout(() => setPromptMessage(null), 4000);
       } else {
         const data = await res.json();
@@ -1240,30 +1342,57 @@ export default function App() {
                 <div className="space-y-1">
                   <textarea
                     value={systemPrompt}
-                    onChange={(e) => setSystemPrompt(e.target.value)}
+                    onChange={(e) => {
+                      setSystemPrompt(e.target.value);
+                      setIsEditingPrompt(true);
+                    }}
                     placeholder="Tizim ko'rsatmalari yuklanmoqda..."
                     rows={12}
                     className="w-full text-xs font-mono px-3 py-2 border border-[#D0CFC9] rounded-md focus:outline-none focus:ring-1 focus:ring-[#4B5E53] focus:border-[#4B5E53] bg-stone-50 leading-relaxed"
                     required
                   />
                   <div className="flex justify-between items-center text-[10px] text-[#777777]">
-                    <span>Mustaqil yoki dinamik tarzda tahrirlash mumkin</span>
+                    <span>
+                      {isEditingPrompt ? (
+                        <span className="text-amber-600 font-semibold animate-pulse">● Tahrirlanmoqda (Saqlashni unutmang)</span>
+                      ) : (
+                        "Mustaqil yoki dinamik tarzda tahrirlash mumkin"
+                      )}
+                    </span>
                     <span className="font-semibold text-[#4B5E53]">{'{memories_text}'} tegi qolishi kerak</span>
                   </div>
                 </div>
 
-                <button
-                  type="submit"
-                  disabled={isSavingPrompt || !systemPrompt}
-                  className={`w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-md text-xs font-semibold uppercase tracking-wider transition-all text-white ${
-                    isSavingPrompt || !systemPrompt
-                      ? "bg-[#4B5E53]/60 cursor-not-allowed" 
-                      : "bg-[#4B5E53] hover:bg-[#3d4d44] shadow-xs cursor-pointer"
-                  }`}
-                >
-                  <Save className="w-4 h-4" />
-                  {isSavingPrompt ? "Saqlanmoqda..." : "Yo'riqnomani Saqlash"}
-                </button>
+                <div className="flex gap-2">
+                  {isEditingPrompt && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsEditingPrompt(false);
+                        // Force retrieve latest prompt from server to discard local edits
+                        fetch("/api/system-prompt")
+                          .then(res => res.json())
+                          .then(data => setSystemPrompt(data.prompt || ""))
+                          .catch(() => {});
+                      }}
+                      className="flex-1 py-2 px-3 border border-stone-300 hover:bg-stone-100 rounded text-[#333333] text-xs font-semibold uppercase tracking-wider transition cursor-pointer"
+                    >
+                      Bekor qilish
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    disabled={isSavingPrompt || !systemPrompt}
+                    className={`${isEditingPrompt ? "flex-1" : "w-full"} inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-md text-xs font-semibold uppercase tracking-wider transition-all text-white ${
+                      isSavingPrompt || !systemPrompt
+                        ? "bg-[#4B5E53]/60 cursor-not-allowed" 
+                        : "bg-[#4B5E53] hover:bg-[#3d4d44] shadow-xs cursor-pointer"
+                    }`}
+                  >
+                    <Save className="w-4 h-4" />
+                    {isSavingPrompt ? "Saqlanmoqda..." : "Yo'riqnomani Saqlash"}
+                  </button>
+                </div>
 
                 <div className="p-3 bg-amber-50/50 border border-amber-100 rounded-lg text-[11px] text-amber-800 leading-normal">
                   💡 <strong>Aqlli AI Funksiyasi:</strong> Telegram'da botga o'zbek tilida bevosita taklif yoki xohishingizni yozsangiz ham AI ushbu yo'riqnomani o'zi mustaqil tushunib, avtomatik ravishda shu yerda o'zgartira oladi! (Masalan: <em>"Menga faqat inglizcha javob ber"</em> yoki <em>"Gapingni doim tabassum bilan tugat"</em> deb yozib ko'ring).
@@ -1491,78 +1620,217 @@ export default function App() {
             </div>
 
             {/* Column 2 - Personal Memory CRUD (col-span-5) */}
-            <div className="lg:col-span-5 p-6 flex flex-col gap-6">
-              <h3 className="font-semibold text-sm flex items-center gap-1.5 text-[#222222]">
-                <Database className="w-4 h-4 text-[#4B5E53]" />
-                Shaxsiy Xotira Boshqaruvi (AI Memory)
-              </h3>
-
-              {/* Add Memory Form */}
-              <form onSubmit={handleAddMemory} className="p-4 border border-emerald-100 bg-emerald-50/20 rounded-lg space-y-3">
-                <div className="text-xs font-semibold text-emerald-800 flex items-center gap-1">
-                  <Plus className="w-3.5 h-3.5" />
-                  Yangi Ma'lumot (Fakt) Qo'shish
+            <div className="lg:col-span-5 p-6 flex flex-col gap-5">
+              <div className="flex items-center justify-between">
+                <h3 className="font-semibold text-sm flex items-center gap-1.5 text-[#222222]">
+                  <Brain className="w-4 h-4 text-[#4B5E53]" />
+                  Claude-like Aqlli Xotira
+                </h3>
+                <div className="flex bg-stone-100 p-0.5 rounded-lg border border-stone-200">
+                  <button
+                    type="button"
+                    onClick={() => setMemoryMode("quick")}
+                    className={`px-2.5 py-1 text-[10px] font-bold rounded-md transition-all cursor-pointer ${
+                      memoryMode === "quick" 
+                        ? "bg-white text-[#4B5E53] shadow-xs" 
+                        : "text-stone-500 hover:text-stone-800"
+                    }`}
+                  >
+                    Tezkor Kiritish
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMemoryMode("chat")}
+                    className={`px-2.5 py-1 text-[10px] font-bold rounded-md transition-all cursor-pointer ${
+                      memoryMode === "chat" 
+                        ? "bg-white text-[#4B5E53] shadow-xs" 
+                        : "text-stone-500 hover:text-stone-800"
+                    }`}
+                  >
+                    AI Chat
+                  </button>
                 </div>
+              </div>
 
-                {memoryMessage && (
-                  <div className={`p-2.5 rounded text-[11px] flex items-center gap-1.5 border ${
-                    memoryMessage.type === "success" 
-                      ? "bg-emerald-50 text-emerald-800 border-emerald-100" 
-                      : "bg-rose-50 text-rose-800 border-rose-100"
-                  }`}>
-                    {memoryMessage.type === "success" ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-600" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-600" />}
-                    <span>{memoryMessage.text}</span>
+              {/* SUCCESS / ERROR ALERTS FOR MEMORY ACTIONS */}
+              {memoryMessage && (
+                <div className={`p-2.5 rounded-lg text-[11px] flex items-center gap-1.5 border leading-relaxed transition ${
+                  memoryMessage.type === "success" 
+                    ? "bg-emerald-50 text-emerald-800 border-emerald-100" 
+                    : "bg-rose-50 text-rose-800 border-rose-100"
+                }`}>
+                  {memoryMessage.type === "success" ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0 text-emerald-600" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-600" />}
+                  <span>{memoryMessage.text}</span>
+                </div>
+              )}
+
+              {/* TAB 1: QUICK INPUT (SMART / MANUAL) */}
+              {memoryMode === "quick" && (
+                <div className="border border-stone-200 rounded-xl p-4 bg-[#FCFBF9] space-y-4 shadow-2xs">
+                  {/* Select Mode within Quick Input */}
+                  <div className="flex justify-between items-center border-b border-stone-100 pb-2">
+                    <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider">Kiritish turi:</span>
+                    <div className="flex gap-4">
+                      <label className="flex items-center gap-1.5 text-xs text-stone-700 cursor-pointer select-none">
+                        <input
+                          type="radio"
+                          name="quick_type"
+                          checked={quickInputType === "ai"}
+                          onChange={() => setQuickInputType("ai")}
+                          className="text-[#4B5E53] focus:ring-0 w-3 h-3 cursor-pointer"
+                        />
+                        <Sparkles className="w-3 h-3 text-amber-500" />
+                        AI Optimizatsiya
+                      </label>
+                      <label className="flex items-center gap-1.5 text-xs text-stone-700 cursor-pointer select-none">
+                        <input
+                          type="radio"
+                          name="quick_type"
+                          checked={quickInputType === "manual"}
+                          onChange={() => setQuickInputType("manual")}
+                          className="text-[#4B5E53] focus:ring-0 w-3 h-3 cursor-pointer"
+                        />
+                        <Database className="w-3 h-3 text-stone-500" />
+                        Qo'lda kiritish
+                      </label>
+                    </div>
                   </div>
-                )}
 
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Kategoriya</label>
+                  {quickInputType === "ai" ? (
+                    /* AI Optimize Form */
+                    <form onSubmit={handleQuickAiSubmit} className="space-y-3">
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Erkin matn yoki xotira</label>
+                        <textarea
+                          placeholder="Masalan: Men har kuni soat 23:00 da uxlayman. Shuni eslab qolgin..."
+                          value={rawQuickText}
+                          onChange={(e) => setRawQuickText(e.target.value)}
+                          rows={3}
+                          className="w-full text-xs px-3 py-2 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-[#4B5E53] bg-white leading-relaxed"
+                          required
+                        />
+                      </div>
+                      <p className="text-[10px] text-stone-400">AI avtomatik ravishda toifa, kalit so'z va fakt qiymatini aniqlab ma'lumotlar bazasiga joylaydi.</p>
+                      <button
+                        type="submit"
+                        disabled={isOptimizingMemory || !rawQuickText.trim()}
+                        className={`w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold text-white transition shadow-sm ${
+                          isOptimizingMemory || !rawQuickText.trim()
+                            ? "bg-[#4B5E53]/60 cursor-not-allowed"
+                            : "bg-[#4B5E53] hover:bg-[#3d4d44] cursor-pointer"
+                        }`}
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        {isOptimizingMemory ? "AI tahlil qilmoqda..." : "AI orqali saqlash"}
+                      </button>
+                    </form>
+                  ) : (
+                    /* Manual Entry Form */
+                    <form onSubmit={handleAddMemory} className="space-y-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Kategoriya</label>
+                          <input
+                            type="text"
+                            placeholder="Masalan: shaxsiy"
+                            value={newMemory.category}
+                            onChange={(e) => setNewMemory({...newMemory, category: e.target.value.toLowerCase()})}
+                            className="w-full text-xs px-2.5 py-1.5 border border-stone-300 rounded-md bg-white"
+                            required
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Kalit so'z</label>
+                          <input
+                            type="text"
+                            placeholder="Masalan: hobbi"
+                            value={newMemory.key}
+                            onChange={(e) => setNewMemory({...newMemory, key: e.target.value.toLowerCase()})}
+                            className="w-full text-xs px-2.5 py-1.5 border border-stone-300 rounded-md bg-white"
+                            required
+                          />
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Fakt qiymati (3-shaxsda)</label>
+                        <input
+                          type="text"
+                          placeholder="Masalan: Shoxrux bo'sh vaqtida kitob o'qiydi."
+                          value={newMemory.value}
+                          onChange={(e) => setNewMemory({...newMemory, value: e.target.value})}
+                          className="w-full text-xs px-2.5 py-1.5 border border-stone-300 rounded-md bg-white"
+                          required
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={isAddingMemory}
+                        className="w-full inline-flex items-center justify-center gap-1 px-4 py-2 rounded-lg text-xs font-semibold bg-[#4B5E53] hover:bg-[#3d4d44] text-white transition shadow-sm cursor-pointer"
+                      >
+                        {isAddingMemory ? "Qo'shilmoqda..." : "Xotiraga Qo'shish"}
+                      </button>
+                    </form>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 2: AI CONVERSATIONAL CHAT */}
+              {memoryMode === "chat" && (
+                <div className="border border-stone-200 rounded-xl bg-white flex flex-col h-[280px] overflow-hidden shadow-2xs">
+                  {/* Chat logs */}
+                  <div className="flex-1 p-3 overflow-y-auto space-y-2 bg-stone-50/50">
+                    {memoryChatHistory.map((msg, i) => {
+                      const isUser = msg.role === "user";
+                      return (
+                        <div key={i} className={`flex flex-col ${isUser ? "items-end" : "items-start"}`}>
+                          <div className={`px-3 py-1.5 rounded-lg text-xs leading-relaxed max-w-[90%] ${
+                            isUser 
+                              ? "bg-[#4B5E53] text-white rounded-tr-none" 
+                              : "bg-white text-stone-800 border border-stone-200 rounded-tl-none shadow-3xs"
+                          }`}>
+                            {msg.content}
+                            
+                            {/* Saved memory tag indicator */}
+                            {!isUser && msg.newMemory && (
+                              <div className="mt-1.5 pt-1.5 border-t border-stone-100 flex items-center gap-1 text-[9px] text-emerald-700 font-bold font-mono uppercase tracking-wider">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping"></span>
+                                ✨ Xotiraga saqlandi: [{msg.newMemory.category}] {msg.newMemory.key}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Chat input form */}
+                  <form onSubmit={handleMemoryChatSubmit} className="p-2 border-t border-stone-200 bg-white flex gap-1.5 items-center">
                     <input
                       type="text"
-                      placeholder="Masalan: shaxsiy"
-                      value={newMemory.category}
-                      onChange={(e) => setNewMemory({...newMemory, category: e.target.value.toLowerCase()})}
-                      className="w-full text-xs px-2.5 py-1.5 border border-[#D0CFC9] rounded bg-white"
+                      placeholder={isSendingMemoryChat ? "AI javobini kuting..." : "Yangi xotira yoki fakt ayting..."}
+                      value={memoryChatInput}
+                      onChange={(e) => setMemoryChatInput(e.target.value)}
+                      disabled={isSendingMemoryChat}
+                      className="flex-1 text-xs px-3 py-1.5 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-[#4B5E53]"
                       required
                     />
-                  </div>
-                  <div className="space-y-1">
-                    <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Kalit so'z</label>
-                    <input
-                      type="text"
-                      placeholder="Masalan: hobbi"
-                      value={newMemory.key}
-                      onChange={(e) => setNewMemory({...newMemory, key: e.target.value.toLowerCase()})}
-                      className="w-full text-xs px-2.5 py-1.5 border border-[#D0CFC9] rounded bg-white"
-                      required
-                    />
-                  </div>
+                    <button
+                      type="submit"
+                      disabled={isSendingMemoryChat || !memoryChatInput.trim()}
+                      className={`p-1.5 rounded-lg text-white transition ${
+                        isSendingMemoryChat || !memoryChatInput.trim()
+                          ? "bg-[#4B5E53]/50 cursor-not-allowed"
+                          : "bg-[#4B5E53] hover:bg-[#3d4d44] cursor-pointer"
+                      }`}
+                    >
+                      <Send className="w-3.5 h-3.5" />
+                    </button>
+                  </form>
                 </div>
-
-                <div className="space-y-1">
-                  <label className="text-[10px] font-semibold text-stone-500 uppercase tracking-wider">Fakt qiymati (3-shaxsda)</label>
-                  <input
-                    type="text"
-                    placeholder="Masalan: Shoxrux bo'sh vaqtida kitob o'qiydi."
-                    value={newMemory.value}
-                    onChange={(e) => setNewMemory({...newMemory, value: e.target.value})}
-                    className="w-full text-xs px-2.5 py-1.5 border border-[#D0CFC9] rounded bg-white"
-                    required
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isAddingMemory}
-                  className="w-full inline-flex items-center justify-center gap-1 px-3 py-1.5 rounded text-xs font-semibold bg-[#4B5E53] hover:bg-[#3d4d44] text-white transition shadow-sm cursor-pointer"
-                >
-                  {isAddingMemory ? "Qo'shilmoqda..." : "Xotiraga Qo'shish"}
-                </button>
-              </form>
+              )}
 
               {/* Memory List & Filter */}
-              <div className="space-y-3 flex-1 flex flex-col">
+              <div className="space-y-3 flex-1 flex flex-col pt-2">
                 <div className="relative">
                   <Search className="w-3.5 h-3.5 text-stone-400 absolute left-3 top-2.5" />
                   <input
@@ -1570,11 +1838,11 @@ export default function App() {
                     placeholder="Xotiralardan qidirish..."
                     value={memorySearch}
                     onChange={(e) => setMemorySearch(e.target.value)}
-                    className="w-full text-xs pl-8 pr-3 py-2 border border-[#D0CFC9] rounded-md focus:outline-none focus:ring-1 focus:ring-[#4B5E53] bg-white"
+                    className="w-full text-xs pl-8 pr-3 py-2 border border-stone-300 rounded-lg focus:outline-none focus:ring-1 focus:ring-[#4B5E53] bg-white shadow-3xs"
                   />
                 </div>
 
-                <div className="border border-[#EBEAE6] rounded-lg overflow-hidden flex-1 max-h-[300px] overflow-y-auto divide-y divide-[#EBEAE6] bg-[#FCFBF9]">
+                <div className="border border-stone-200 rounded-xl overflow-hidden flex-1 max-h-[300px] overflow-y-auto divide-y divide-stone-150 bg-[#FCFBF9] shadow-3xs">
                   {isLoadingMemories ? (
                     <div className="p-4 text-center text-xs text-stone-400">Yuklanmoqda...</div>
                   ) : dbMemories.length === 0 ? (
@@ -1587,22 +1855,22 @@ export default function App() {
                         m.value.toLowerCase().includes(memorySearch.toLowerCase())
                       )
                       .map((memory) => (
-                        <div key={memory.id} className="p-3 text-xs flex items-start justify-between gap-3 hover:bg-stone-50">
+                        <div key={memory.id} className="p-3 text-xs flex items-start justify-between gap-3 hover:bg-stone-50/80 transition-colors">
                           <div className="space-y-1 flex-1">
                             <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="text-[10px] bg-stone-100 text-[#4B5E53] px-1.5 py-0.2 rounded font-semibold font-mono tracking-wider uppercase">
+                              <span className="text-[9px] bg-stone-200/60 text-[#4B5E53] px-1.5 py-0.5 rounded-md font-semibold font-mono tracking-wider uppercase">
                                 {memory.category}
                               </span>
                               <span className="text-[10px] font-bold text-stone-600 font-mono">
                                 {memory.key}
                               </span>
                             </div>
-                            <p className="text-stone-700 leading-normal">{memory.value}</p>
+                            <p className="text-stone-700 leading-normal font-medium">{memory.value}</p>
                           </div>
                           <button
                             type="button"
                             onClick={() => handleDeleteMemory(memory.id)}
-                            className="text-stone-400 hover:text-rose-600 p-1 transition rounded hover:bg-stone-100 cursor-pointer"
+                            className="text-stone-400 hover:text-rose-600 p-1.5 transition rounded-md hover:bg-stone-100 cursor-pointer"
                             title="Xotirani o'chirish"
                           >
                             <Trash2 className="w-3.5 h-3.5" />

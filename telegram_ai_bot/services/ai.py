@@ -118,9 +118,10 @@ async def generate_response(system_prompt: str, chat_history: list, user_message
     user_message: current message content
     """
     if not AI_API_KEY:
-        logger.warning("AI_API_KEY topilmadi yoki kiritilmagan. Telegram chatiga xabar yuborilmaydi (sukut rejimida). Xatolik faqat Veb panelda ko'rsatiladi.")
+        logger.warning("AI_API_KEY topilmadi yoki kiritilmagan.")
         return {
             "reply": "",
+            "error_msg": "AI API kaliti (AI_API_KEY yoki GEMINI_API_KEY) kiritilmagan! Iltimos, veb panel yoki Render sozlamalari orqali API kalitni kiriting.",
             "notify_owner": False,
             "notification": None,
             "memory_update": {"should_save": False, "category": None, "key": None, "value": None}
@@ -178,6 +179,7 @@ async def generate_response(system_prompt: str, chat_history: list, user_message
         logger.error(f"AI API chaqiruvida xatolik yuz berdi: {e}", exc_info=True)
         return {
             "reply": "",
+            "error_msg": f"AI API chaqiruvida xatolik yuz berdi: {str(e)}",
             "notify_owner": False,
             "notification": None,
             "memory_update": {"should_save": False, "category": None, "key": None, "value": None}

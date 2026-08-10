@@ -4,3 +4,5 @@ aiosqlite
 python-dotenv
 openai
 pydantic
+Telethon
+aiohttp

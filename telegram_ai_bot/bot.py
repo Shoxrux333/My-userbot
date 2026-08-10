@@ -133,6 +133,101 @@ def save_credentials_to_dotenv(api_id, api_hash, phone):
             except Exception as e:
                 logger.error(f"Error writing to {path}: {e}")
 
+async def check_filters(event, user_id, first_name, last_name, client_inst):
+    """
+    Returns True if the message is allowed by filters.
+    Returns False if the message should be ignored or blocked.
+    """
+    try:
+        settings_path = os.path.join(os.path.dirname(__file__), "filter_settings.json")
+        
+        # Default fallback values if file cannot be read
+        blacklist_enabled = False
+        blocked_ids = []
+        group_filter_enabled = False
+        allowed_group_ids = []
+        
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    filter_data = json.load(f)
+                blacklist_enabled = filter_data.get("blacklist_enabled", False)
+                blocked_ids = filter_data.get("blocked_ids", [])
+                group_filter_enabled = filter_data.get("group_filter_enabled", False)
+                allowed_group_ids = filter_data.get("allowed_group_ids", [])
+            except Exception as re:
+                logger.error(f"Error reading filter settings file: {re}")
+                # Play safe: if we cannot load settings and this is a group, block it
+                if not event.is_private:
+                    return False
+
+        # Convert list of values to integers safely
+        def to_ints(lst):
+            if not lst or not isinstance(lst, list):
+                return []
+            res = []
+            for x in lst:
+                try:
+                    res.append(int(str(x).strip()))
+                except (ValueError, TypeError):
+                    pass
+            return res
+
+        blocked_ids_ints = to_ints(blocked_ids)
+        allowed_group_ids_ints = to_ints(allowed_group_ids)
+
+        # Determine if sender is me (the owner)
+        is_owner = (user_id == OWNER_ID)
+        try:
+            me = await client_inst.get_me()
+            if me and user_id == me.id:
+                is_owner = True
+        except Exception:
+            pass
+
+        # 1. Blacklist check (never blocks Owner)
+        if blacklist_enabled and not is_owner:
+            if user_id in blocked_ids_ints or event.chat_id in blocked_ids_ints:
+                fullname = f"{first_name or ''} {last_name or ''}".strip() or "Ismsiz"
+                logger.info(f"ID Filter: Blocked message from {fullname} (ID: {user_id}, Chat: {event.chat_id}) - blacklisted")
+                return False
+
+        # 2. Group filter check
+        if not event.is_private:
+            if not group_filter_enabled:
+                # If group filter is disabled, do not respond in groups/channels at all
+                logger.info(f"ID Filter: Ignored group message in chat {event.chat_id} because group filter is disabled")
+                return False
+            else:
+                # Group filter is enabled, check if current group chat_id is allowed
+                chat_id = event.chat_id
+                chat_id_str = str(chat_id)
+                
+                # Check direct match
+                is_allowed = chat_id in allowed_group_ids_ints
+                
+                # If not matched directly, check normalized match to avoid negative/positive/prefix mismatches
+                if not is_allowed:
+                    for allowed_id in allowed_group_ids_ints:
+                        allowed_str = str(allowed_id)
+                        norm_chat = chat_id_str.replace("-100", "").replace("-", "").strip()
+                        norm_allowed = allowed_str.replace("-100", "").replace("-", "").strip()
+                        if norm_chat and norm_chat == norm_allowed:
+                            is_allowed = True
+                            break
+                
+                if not is_allowed:
+                    logger.info(f"ID Filter: Ignored message in unauthorized group (ID: {event.chat_id})")
+                    return False
+
+        return True
+    except Exception as e:
+        logger.error(f"Critical error in filter check: {e}", exc_info=True)
+        # Default to fail-closed on any critical filter check exceptions
+        if not event.is_private:
+            return False
+        return True
+
 # Register Telethon Message Handler
 def register_message_handlers(client_inst):
     @client_inst.on(events.NewMessage(incoming=True))
@@ -153,58 +248,9 @@ def register_message_handlers(client_inst):
                 return
 
             # Check ID filters (Blacklist & Group Whitelist)
-            try:
-                settings_path = os.path.join(os.path.dirname(__file__), "filter_settings.json")
-                if os.path.exists(settings_path):
-                    with open(settings_path, "r", encoding="utf-8") as f:
-                        filter_data = json.load(f)
-                    
-                    blacklist_enabled = filter_data.get("blacklist_enabled", False)
-                    blocked_ids = filter_data.get("blocked_ids", [])
-                    group_filter_enabled = filter_data.get("group_filter_enabled", False)
-                    allowed_group_ids = filter_data.get("allowed_group_ids", [])
-
-                    # Convert lists of strings/numbers to integers
-                    def to_ints(lst):
-                        res = []
-                        for x in lst:
-                            try:
-                                res.append(int(x))
-                            except ValueError:
-                                pass
-                        return res
-
-                    blocked_ids_ints = to_ints(blocked_ids)
-                    allowed_group_ids_ints = to_ints(allowed_group_ids)
-
-                    # Determine if sender is me (the owner)
-                    is_owner = (user_id == OWNER_ID)
-                    try:
-                        me = await client_inst.get_me()
-                        if me and user_id == me.id:
-                            is_owner = True
-                    except Exception:
-                        pass
-
-                    # 1. Blacklist check (never blocks Owner)
-                    if blacklist_enabled and not is_owner:
-                        if user_id in blocked_ids_ints or event.chat_id in blocked_ids_ints:
-                            fullname = f"{first_name or ''} {last_name or ''}".strip() or "Ismsiz"
-                            logger.info(f"ID Filter: Blocked message from {fullname} (ID: {user_id}, Chat: {event.chat_id}) - blacklisted")
-                            return
-
-                    # 2. Group filter check
-                    if not event.is_private:
-                        if not group_filter_enabled:
-                            # If group filter is disabled, do not respond in groups/channels at all
-                            return
-                        else:
-                            # Group filter is enabled, check if current group chat_id is allowed
-                            if event.chat_id not in allowed_group_ids_ints:
-                                logger.info(f"ID Filter: Ignored message in unauthorized group (ID: {event.chat_id})")
-                                return
-            except Exception as fe:
-                logger.error(f"Error checking filters: {fe}")
+            is_allowed = await check_filters(event, user_id, first_name, last_name, client_inst)
+            if not is_allowed:
+                return
 
             # Ignore commands in PM unless they are something specific
             if message_text.startswith("/"):

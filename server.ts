@@ -229,10 +229,29 @@ async function setupAndStartBot() {
   });
 }
 
-function startBot() {
+async function startBot() {
   if (botProcess) {
     botProcess.kill();
     botProcess = null;
+  }
+
+  // Load configuration from DB if available and update process.env BEFORE writing .env
+  try {
+    const dbConfigResult = await runQueryScript(["get_bot_config"]);
+    if (dbConfigResult && dbConfigResult.success && dbConfigResult.config) {
+      const cfg = dbConfigResult.config;
+      if (cfg.bot_token) process.env.BOT_TOKEN = cfg.bot_token;
+      if (cfg.ai_api_key) process.env.AI_API_KEY = cfg.ai_api_key;
+      if (cfg.owner_id) process.env.OWNER_ID = cfg.owner_id;
+      if (cfg.ai_base_url) process.env.AI_BASE_URL = cfg.ai_base_url;
+      if (cfg.ai_model) process.env.AI_MODEL = cfg.ai_model;
+      if (cfg.telegram_api_id) process.env.TELEGRAM_API_ID = cfg.telegram_api_id;
+      if (cfg.telegram_api_hash) process.env.TELEGRAM_API_HASH = cfg.telegram_api_hash;
+      if (cfg.telegram_phone) process.env.TELEGRAM_PHONE = cfg.telegram_phone;
+      addBotLog("Bot va AI sozlamalari SQLite bazasidan yuklandi va qo'llanildi.");
+    }
+  } catch (err: any) {
+    addBotLog(`Bazadan sozlamalarni yuklashda xatolik: ${err.message}`);
   }
 
   // Write .env files on boot if missing
@@ -306,7 +325,7 @@ app.post("/api/bot-start", (req, res) => {
   res.json({ success: true });
 });
 
-app.post("/api/bot-config", (req, res) => {
+app.post("/api/bot-config", async (req, res) => {
   dotenv.config({ override: true });
   const { BOT_TOKEN, AI_API_KEY, OWNER_ID, AI_BASE_URL, AI_MODEL, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE } = req.body;
 
@@ -335,6 +354,24 @@ app.post("/api/bot-config", (req, res) => {
     fs.writeFileSync(path.join(process.cwd(), "telegram_ai_bot", ".env"), envContent, "utf8");
 
     addBotLog("Configuration updated and saved to .env files.");
+
+    // Save to SQLite database
+    try {
+      await runQueryScript([
+        "save_bot_config",
+        process.env.BOT_TOKEN || "",
+        process.env.AI_API_KEY || "",
+        process.env.OWNER_ID || "",
+        process.env.AI_BASE_URL || "https://api.openai.com/v1",
+        process.env.AI_MODEL || "gpt-4o-mini",
+        process.env.TELEGRAM_API_ID || "",
+        process.env.TELEGRAM_API_HASH || "",
+        process.env.TELEGRAM_PHONE || ""
+      ]);
+      addBotLog("Configuration successfully saved to SQLite database for persistent storage.");
+    } catch (dbErr: any) {
+      addBotLog(`WARNING: Failed to persist config to SQLite: ${dbErr.message}`);
+    }
 
     if (shouldBeRunning) {
       isRestarting = true;
@@ -385,6 +422,23 @@ app.post("/api/userbot/send-code", async (req, res) => {
     fs.writeFileSync(".env", envContent, "utf8");
     fs.writeFileSync(path.join(process.cwd(), "telegram_ai_bot", ".env"), envContent, "utf8");
     addBotLog("Saved userbot credentials to .env files upon verification code request.");
+
+    // Save to SQLite database
+    try {
+      await runQueryScript([
+        "save_bot_config",
+        process.env.BOT_TOKEN || "",
+        process.env.AI_API_KEY || "",
+        process.env.OWNER_ID || "",
+        process.env.AI_BASE_URL || "https://api.openai.com/v1",
+        process.env.AI_MODEL || "gpt-4o-mini",
+        process.env.TELEGRAM_API_ID || "",
+        process.env.TELEGRAM_API_HASH || "",
+        process.env.TELEGRAM_PHONE || ""
+      ]);
+    } catch (dbErr: any) {
+      addBotLog(`WARNING: Failed to persist userbot credentials to SQLite: ${dbErr.message}`);
+    }
   } catch (err: any) {
     addBotLog(`ERROR saving credentials on send-code: ${err.message}`);
   }
@@ -596,6 +650,67 @@ Javobni faqat JSON formatida qaytaring:
   }
 });
 
+// Endpoint 3: AI-based ID filtering
+app.post("/api/gemini/parse-ids", async (req, res) => {
+  const { rawText } = req.body;
+  if (!rawText) {
+    return res.status(400).json({ success: false, error: "Matn kiritilmadi." });
+  }
+
+  try {
+    const ai = getGeminiClient();
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: `Siz Telegram ID raqamlarini matndan ajratib beruvchi aqlli yordamchisiz.
+Sizga foydalanuvchi turli xil matnlar, guruh xabarlari yoki shunchaki ID ro'yxatini beradi. Sizning vazifangiz ushbu matndan barcha Telegram ID raqamlarini (masalan: 1234567, -10012345678, -456789123 va hk) aniqlash va guruhlashdan iborat.
+Agar matnda ularning bloklangan/spam/taqiqlanganligi aytilgan bo'lsa (masalan: "spam", "blokla", "taqiqlanganlar", "blacklist"), ularni blacklisted_ids ro'yxatiga qo'shing.
+Agar guruhlarga taalluqliligi aytilgan bo'lsa (masalan: "guruhlar", "ruxsat berilgan", "oq ro'yxat", "whitelist"), ularni whitelisted_group_ids ro'yxatiga qo'shing.
+Agar aniq bo'lmasa, ularni unspecified_ids ro'yxatiga qo'ying.
+
+Matn: "${rawText}"
+
+Javobni faqat ushbu JSON formatida qaytaring:
+{
+  "blacklisted_ids": ["ID_1", "ID_2"],
+  "whitelisted_group_ids": ["ID_3", "ID_4"],
+  "unspecified_ids": ["ID_5", "ID_6"]
+}`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            blacklisted_ids: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            whitelisted_group_ids: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            unspecified_ids: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            }
+          },
+          required: ["blacklisted_ids", "whitelisted_group_ids", "unspecified_ids"]
+        }
+      }
+    });
+
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("AI tahlil qila olmadi.");
+    }
+
+    const parsed = JSON.parse(resultText);
+    res.json({ success: true, ...parsed });
+  } catch (err: any) {
+    addBotLog(`ERROR in parse-ids AI: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get("/api/system-prompt", (req, res) => {
   const filePath = path.join(process.cwd(), "telegram_ai_bot", "prompts", "system_prompt.txt");
   if (fs.existsSync(filePath)) {
@@ -626,42 +741,66 @@ app.post("/api/system-prompt", (req, res) => {
   }
 });
 
-app.get("/api/filter-settings", (req, res) => {
-  const filterSettingsPath = path.join(process.cwd(), "telegram_ai_bot", "filter_settings.json");
-  if (fs.existsSync(filterSettingsPath)) {
-    try {
-      const data = fs.readFileSync(filterSettingsPath, "utf8");
-      const parsed = JSON.parse(data);
+app.get("/api/filter-settings", async (req, res) => {
+  try {
+    const data = await runQueryScript(["get_filter_settings"]);
+    if (data && data.success) {
       return res.json({
-        blacklist_enabled: parsed.blacklist_enabled ?? false,
-        blocked_ids: parsed.blocked_ids ?? [],
-        group_filter_enabled: parsed.group_filter_enabled ?? false,
-        allowed_group_ids: parsed.allowed_group_ids ?? []
+        blacklist_enabled: data.blacklist_enabled,
+        blocked_ids: data.blocked_ids,
+        group_filter_enabled: data.group_filter_enabled,
+        allowed_group_ids: data.allowed_group_ids
       });
-    } catch (e: any) {
-      return res.status(500).json({ error: e.message });
+    } else {
+      throw new Error((data && data.error) || "Failed to fetch settings from DB");
     }
+  } catch (err: any) {
+    // Fallback to local file read if query fails
+    const filterSettingsPath = path.join(process.cwd(), "telegram_ai_bot", "filter_settings.json");
+    if (fs.existsSync(filterSettingsPath)) {
+      try {
+        const data = fs.readFileSync(filterSettingsPath, "utf8");
+        const parsed = JSON.parse(data);
+        return res.json({
+          blacklist_enabled: parsed.blacklist_enabled ?? false,
+          blocked_ids: parsed.blocked_ids ?? [],
+          group_filter_enabled: parsed.group_filter_enabled ?? false,
+          allowed_group_ids: parsed.allowed_group_ids ?? []
+        });
+      } catch (e: any) {
+        return res.status(500).json({ error: e.message });
+      }
+    }
+    res.json({ blacklist_enabled: false, blocked_ids: [], group_filter_enabled: false, allowed_group_ids: [] });
   }
-  res.json({ blacklist_enabled: false, blocked_ids: [], group_filter_enabled: false, allowed_group_ids: [] });
 });
 
-app.post("/api/filter-settings", (req, res) => {
+app.post("/api/filter-settings", async (req, res) => {
   const { blacklist_enabled, blocked_ids, group_filter_enabled, allowed_group_ids } = req.body;
   if (blacklist_enabled === undefined || !Array.isArray(blocked_ids) || group_filter_enabled === undefined || !Array.isArray(allowed_group_ids)) {
     return res.status(400).json({ error: "Noto'g'ri filtr parametrlari" });
   }
 
-  const filterSettingsPath = path.join(process.cwd(), "telegram_ai_bot", "filter_settings.json");
   try {
-    const settings = {
-      blacklist_enabled,
-      blocked_ids,
-      group_filter_enabled,
-      allowed_group_ids
-    };
-    fs.writeFileSync(filterSettingsPath, JSON.stringify(settings, null, 2), "utf8");
-    addBotLog(`Filtr sozlamalari yangilandi. Taqiq: ${blacklist_enabled ? "YON" : "OCH"} (${blocked_ids.length} ta ID), Guruh: ${group_filter_enabled ? "YON" : "OCH"} (${allowed_group_ids.length} ta guruh)`);
-    res.json({ success: true, settings });
+    const bl_enabled_str = blacklist_enabled ? "true" : "false";
+    const grp_enabled_str = group_filter_enabled ? "true" : "false";
+    const blocked_ids_json = JSON.stringify(blocked_ids);
+    const allowed_group_ids_json = JSON.stringify(allowed_group_ids);
+
+    const dbResult = await runQueryScript([
+      "save_filter_settings",
+      bl_enabled_str,
+      blocked_ids_json,
+      grp_enabled_str,
+      allowed_group_ids_json
+    ]);
+
+    if (dbResult && dbResult.success) {
+      addBotLog(`Filtr sozlamalari bazada va diskda yangilandi. Taqiq: ${blacklist_enabled ? "YON" : "OCH"} (${blocked_ids.length} ta ID), Guruh: ${group_filter_enabled ? "YON" : "OCH"} (${allowed_group_ids.length} ta guruh)`);
+      res.json({ success: true, settings: { blacklist_enabled, blocked_ids, group_filter_enabled, allowed_group_ids } });
+    } else {
+      throw new Error((dbResult && dbResult.error) || "Failed to save settings to DB");
+    }
   } catch (err: any) {
     addBotLog(`ERROR: Filtr sozlamalarini saqlashda xatolik: ${err.message}`);
     res.status(500).json({ success: false, error: err.message });

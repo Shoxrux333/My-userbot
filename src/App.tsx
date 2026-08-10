@@ -75,6 +75,17 @@ export default function App() {
   const [isSavingFilter, setIsSavingFilter] = useState(false);
   const [filterMessage, setFilterMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
+  // AI-based ID filtering states
+  const [rawFilterText, setRawFilterText] = useState("");
+  const [isParsingIds, setIsParsingIds] = useState(false);
+  const [parsedIdsResult, setParsedIdsResult] = useState<{
+    blacklisted_ids: string[];
+    whitelisted_group_ids: string[];
+    unspecified_ids: string[];
+  } | null>(null);
+  const [aiFilterMessage, setAiFilterMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [unspecifiedDestination, setUnspecifiedDestination] = useState<Record<string, "blacklist" | "whitelist" | "ignore">>({});
+
   // Form inputs state
   const [botToken, setBotToken] = useState("");
   const [aiApiKey, setAiApiKey] = useState("");
@@ -212,6 +223,78 @@ export default function App() {
   const handleToggleGroupFilter = (checked: boolean) => {
     setGroupFilterEnabled(checked);
     saveFilterSettings(blacklistEnabled, blockedIds, checked, allowedGroupIds);
+  };
+
+  const handleAiParseIds = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!rawFilterText.trim()) return;
+
+    setIsParsingIds(true);
+    setAiFilterMessage(null);
+    setParsedIdsResult(null);
+    setUnspecifiedDestination({});
+    try {
+      const res = await fetch("/api/gemini/parse-ids", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawText: rawFilterText })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        const total = data.blacklisted_ids.length + data.whitelisted_group_ids.length + data.unspecified_ids.length;
+        if (total === 0) {
+          setAiFilterMessage({ type: "error", text: "AI matndan hech qanday Telegram ID topa olmadi." });
+        } else {
+          setParsedIdsResult(data);
+          // Pre-populate unspecified destination
+          const initialDest: Record<string, "blacklist" | "whitelist" | "ignore"> = {};
+          data.unspecified_ids.forEach((id: string) => {
+            initialDest[id] = "blacklist"; // default to blacklist
+          });
+          setUnspecifiedDestination(initialDest);
+          setAiFilterMessage({ type: "success", text: `AI jami ${total} ta ID topdi!` });
+        }
+      } else {
+        setAiFilterMessage({ type: "error", text: data.error || "AI IDlarni ajratishda xatolik yuz berdi." });
+      }
+    } catch (err) {
+      setAiFilterMessage({ type: "error", text: "Server bilan bog'lanishda xatolik." });
+    } finally {
+      setIsParsingIds(false);
+    }
+  };
+
+  const handleApplyAiIds = () => {
+    if (!parsedIdsResult) return;
+
+    // Build lists of IDs to add
+    const blacklistToAdd = [...parsedIdsResult.blacklisted_ids];
+    const whitelistToAdd = [...parsedIdsResult.whitelisted_group_ids];
+
+    // Distribute unspecified IDs based on user selection
+    Object.entries(unspecifiedDestination).forEach(([id, dest]) => {
+      if (dest === "blacklist") {
+        blacklistToAdd.push(id);
+      } else if (dest === "whitelist") {
+        whitelistToAdd.push(id);
+      }
+    });
+
+    // Merge with existing IDs, avoiding duplicates
+    const uniqueBlacklist = Array.from(new Set([...blockedIds, ...blacklistToAdd]));
+    const uniqueWhitelist = Array.from(new Set([...allowedGroupIds, ...whitelistToAdd]));
+
+    setBlockedIds(uniqueBlacklist);
+    setAllowedGroupIds(uniqueWhitelist);
+    
+    // Save to server
+    saveFilterSettings(blacklistEnabled, uniqueBlacklist, groupFilterEnabled, uniqueWhitelist);
+    
+    // Clear and success message
+    setParsedIdsResult(null);
+    setRawFilterText("");
+    setAiFilterMessage({ type: "success", text: "AI tomonidan ajratilgan IDlar muvaffaqiyatli qo'shildi va saqlandi!" });
+    setTimeout(() => setAiFilterMessage(null), 5000);
   };
 
   const handleSendCode = async (e: React.FormEvent) => {
@@ -1302,6 +1385,146 @@ export default function App() {
                             ))}
                           </div>
                         )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* FILTR 3: AI ORQALI ID-LARNI KIRITISH */}
+                <div className="border border-stone-200 rounded-lg p-4 space-y-4 bg-stone-50/50">
+                  <div>
+                    <h4 className="text-xs font-bold text-stone-800 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-[#4B5E53]" />
+                      AI Orqali ID-larni Oson Kiritish (AI ID Filter)
+                    </h4>
+                    <p className="text-[10px] text-stone-500 mt-0.5">
+                      Matndan (masalan, guruh ro'yxatlari yoki xabarlardan) Telegram ID raqamlarini avtomatik ajratib olish va ro'yxatga qo'shish.
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleAiParseIds} className="space-y-3 pt-2 border-t border-stone-100">
+                    <textarea
+                      value={rawFilterText}
+                      onChange={(e) => setRawFilterText(e.target.value)}
+                      placeholder="Bu yerga matnni yoki ID ro'yxatini joylashtiring (masalan: 'Blokla -10012345 yozganlarni va 987654 ruxsat ber')"
+                      rows={3}
+                      className="w-full text-xs px-3 py-2 border border-[#D0CFC9] rounded-md focus:outline-none focus:ring-1 focus:ring-[#4B5E53] focus:border-[#4B5E53] bg-white"
+                    />
+
+                    <div className="flex justify-end">
+                      <button
+                        type="submit"
+                        disabled={isParsingIds || !rawFilterText.trim()}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold bg-[#4B5E53] hover:bg-[#3d4d44] text-white transition-all cursor-pointer whitespace-nowrap disabled:opacity-50"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        {isParsingIds ? "AI tahlil qilmoqda..." : "AI orqali ID-larni ajratish"}
+                      </button>
+                    </div>
+                  </form>
+
+                  {aiFilterMessage && (
+                    <div className={`p-2.5 rounded-md text-xs flex items-center gap-2 border ${
+                      aiFilterMessage.type === "success" 
+                        ? "bg-emerald-50 text-emerald-800 border-emerald-100" 
+                        : "bg-rose-50 text-rose-800 border-rose-100"
+                    }`}>
+                      {aiFilterMessage.type === "success" ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />}
+                      <span className="text-[11px]">{aiFilterMessage.text}</span>
+                    </div>
+                  )}
+
+                  {/* Show parsed results and allow customization before applying */}
+                  {parsedIdsResult && (
+                    <div className="p-3 bg-white border border-stone-200 rounded-lg space-y-3.5">
+                      <h5 className="text-[11px] font-bold text-stone-700 border-b border-stone-100 pb-1">AI tahlili natijalari:</h5>
+                      
+                      {/* Blacklist IDs parsed */}
+                      {parsedIdsResult.blacklisted_ids.length > 0 && (
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold text-rose-700 uppercase tracking-wider block">Bloklanganlar ro'yxati uchun ({parsedIdsResult.blacklisted_ids.length}):</span>
+                          <div className="flex flex-wrap gap-1">
+                            {parsedIdsResult.blacklisted_ids.map(id => (
+                              <span key={id} className="text-[10px] font-mono px-2 py-0.5 bg-rose-50 text-rose-700 rounded border border-rose-100">{id}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Whitelist Group IDs parsed */}
+                      {parsedIdsResult.whitelisted_group_ids.length > 0 && (
+                        <div className="space-y-1">
+                          <span className="text-[10px] font-bold text-emerald-700 uppercase tracking-wider block">Ruxsat etilgan guruhlar uchun ({parsedIdsResult.whitelisted_group_ids.length}):</span>
+                          <div className="flex flex-wrap gap-1">
+                            {parsedIdsResult.whitelisted_group_ids.map(id => (
+                              <span key={id} className="text-[10px] font-mono px-2 py-0.5 bg-emerald-50 text-emerald-700 rounded border border-emerald-100">{id}</span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Unspecified IDs parsed (User chooses destination) */}
+                      {parsedIdsResult.unspecified_ids.length > 0 && (
+                        <div className="space-y-2">
+                          <span className="text-[10px] font-bold text-stone-500 uppercase tracking-wider block">Vazifasi aniqlanmagan ID-lar ({parsedIdsResult.unspecified_ids.length}):</span>
+                          <div className="divide-y divide-stone-100 border border-stone-100 rounded bg-stone-50 max-h-36 overflow-y-auto">
+                            {parsedIdsResult.unspecified_ids.map(id => (
+                              <div key={id} className="p-1.5 flex items-center justify-between text-[11px] font-mono">
+                                <span className="text-stone-700 font-medium">{id}</span>
+                                <div className="flex gap-1.5">
+                                  <label className="flex items-center gap-1 cursor-pointer">
+                                    <input
+                                      type="radio"
+                                      name={`dest-${id}`}
+                                      checked={unspecifiedDestination[id] === "blacklist"}
+                                      onChange={() => setUnspecifiedDestination(prev => ({ ...prev, [id]: "blacklist" }))}
+                                      className="accent-rose-600 scale-90"
+                                    />
+                                    <span className="text-[10px] text-rose-700">Bloklash</span>
+                                  </label>
+                                  <label className="flex items-center gap-1 cursor-pointer">
+                                    <input
+                                      type="radio"
+                                      name={`dest-${id}`}
+                                      checked={unspecifiedDestination[id] === "whitelist"}
+                                      onChange={() => setUnspecifiedDestination(prev => ({ ...prev, [id]: "whitelist" }))}
+                                      className="accent-emerald-700 scale-90"
+                                    />
+                                    <span className="text-[10px] text-emerald-700">Ruxsat</span>
+                                  </label>
+                                  <label className="flex items-center gap-1 cursor-pointer">
+                                    <input
+                                      type="radio"
+                                      name={`dest-${id}`}
+                                      checked={unspecifiedDestination[id] === "ignore"}
+                                      onChange={() => setUnspecifiedDestination(prev => ({ ...prev, [id]: "ignore" }))}
+                                      className="accent-stone-500 scale-90"
+                                    />
+                                    <span className="text-[10px] text-stone-500">Tashlab ketish</span>
+                                  </label>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="pt-2.5 border-t border-stone-100 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setParsedIdsResult(null)}
+                          className="px-3 py-1.5 rounded-md text-xs font-semibold border border-stone-200 text-stone-600 hover:bg-stone-50 transition-all cursor-pointer"
+                        >
+                          Bekor qilish
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleApplyAiIds}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-md text-xs font-semibold bg-[#4B5E53] hover:bg-[#3d4d44] text-white transition-all cursor-pointer"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          ID-larni Ro'yxatga Qo'shish
+                        </button>
                       </div>
                     </div>
                   )}
